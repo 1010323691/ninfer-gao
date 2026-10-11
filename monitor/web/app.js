@@ -26,19 +26,19 @@ function setTheme(t, save) {
 $("theme-btn").onclick = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
 setTheme(document.documentElement.dataset.theme || "light", false);
 
-// ---- the eight cards
+// ---- the eleven cards (4 + 4 + 3 per row)
 const METRICS = [
   {key: "speed", label: "Speed", icon: "gauge"},
+  {key: "batch", label: "Batch", icon: "gauge"},
+  {key: "reuse", label: "Prefix reuse", icon: "layers", tone: "info"},
+  {key: "pressure", label: "Cache pressure", icon: "bolt", tone: "warn"},
   {key: "gpu", label: "GPU load", icon: "gpu"},
   {key: "vram", label: "VRAM", icon: "layers"},
-  {key: "temp", label: "GPU temp", icon: "thermometer", tone: "warn"},
   {key: "power", label: "Power", icon: "bolt"},
-  {key: "pcie", label: "PCIe", icon: "link", tone: "info"},
+  {key: "temp", label: "GPU temp", icon: "thermometer", tone: "warn"},
   {key: "cpu", label: "CPU", icon: "cpu"},
+  {key: "pcie", label: "PCIe", icon: "link", tone: "info"},
   {key: "disk", label: "Disk read", icon: "disk", tone: "info"},
-  {key: "reuse", label: "Prefix reuse", icon: "layers", tone: "info"},
-  {key: "batch", label: "Batch", icon: "gauge"},
-  {key: "pressure", label: "Cache pressure", icon: "bolt", tone: "warn"},
 ];
 const SPARK_PATHS = `<path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
   stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>`;
