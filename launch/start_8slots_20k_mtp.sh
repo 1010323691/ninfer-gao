@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 8 槽位，20k 上下文，KV 池 auto，关闭图像，MTP。
+# 8 槽位，20k 上下文，KV 池 auto，关闭图像，关闭思考，MTP。
 set -euo pipefail
 MON_PID=
 cleanup() {
@@ -37,9 +37,11 @@ else
   echo "[提示] $MON_PORT 已被占用，未启动监控台。"
 fi
 args=(
-  --spec mtp --draft-tokens 3 --lm-head-draft
+  --spec mtp --draft-tokens 5 --lm-head-draft
   --max-context 20000 --kv-capacity auto --kv-dtype fp8
-  --prefill-chunk 1024 --max-concurrency 8 --device-state-slots 8
+  --prefill-chunk 1024 --max-concurrency 8 --device-state-slots 4
+  --host-context-mib 4096
+  --no-thinking
   --host 0.0.0.0 --port "$PORT" --api-key "$API_KEY"
   --model-id qwen3.8-27b-8slots
   --request-log-jsonl logs/requests.jsonl
