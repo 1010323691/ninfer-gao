@@ -671,11 +671,16 @@ std::size_t ProgramImpl::release_cold_host(std::span<const CheckpointHandle> han
                     return;
                 }
                 if (!state_store->host_resident(image)) { return; }
+                // Another checkpoint outside the demoted set holds this image: it stays in Host
+                // with its copy and does not count against the cold-only limit.
+                if (state_store->checkpoint_references(image) >
+                    holders[shared_state_key(*state_store, image)]) {
+                    return;
+                }
                 if (!state_store->cold_replica_current(image) ||
                     !state_store->can_drop_host_to_cold(image)) {
                     plan.whole = false;
-                } else if (state_store->checkpoint_references(image) <=
-                           holders[shared_state_key(*state_store, image)]) {
+                } else {
                     plan.state = image;
                 }
             },
