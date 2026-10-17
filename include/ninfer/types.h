@@ -133,6 +133,17 @@ struct ContextCacheOptions {
     // This does not bound total process RAM.
     // Engine::options() returns both resolved capacities after construction.
     std::optional<std::size_t> host_capacity_bytes;
+    // Process-volatile SSD tier below Host. Empty disables it. Startup locks and clears the
+    // directory's segment files and refuses a RAM-backed or too slow directory.
+    std::filesystem::path cold_directory;
+    // Upper bound for SSD segment files; the file system must have this much space available.
+    std::uint64_t cold_capacity_bytes = 100ULL * 1024 * 1024 * 1024;
+    // Age rule: a Host victim whose last real demand is older than this is erased on demand
+    // (oldest first) instead of being demoted to the SSD.
+    std::uint32_t cold_demote_window_seconds = 600;
+    // Pre-write victims inside the window to the SSD (Host kept) while free Host context is
+    // below this percentage of its capacity. Zero disables pre-writing.
+    std::uint32_t cold_prewrite_watermark_percent = 10;
 };
 
 struct ContextCostOptions {
@@ -785,6 +796,11 @@ struct GenerationSchedulingStats {
     std::uint64_t paused_ns            = 0;
     std::uint64_t device_to_host_bytes = 0;
     std::uint64_t host_to_device_bytes = 0;
+    // SSD-to-Host restores this request waited for before binding, their completed object
+    // bytes, and the wait from restore start (or join) to completion.
+    std::uint64_t cold_restores        = 0;
+    std::uint64_t cold_to_host_bytes   = 0;
+    std::uint64_t cold_restore_wait_ns = 0;
 };
 
 // Request-owned execution work. GPU stream intervals overlap Host submission and completion
@@ -869,6 +885,11 @@ enum class AdmissionFallbackReason : std::uint8_t {
     CostChanged,
     CapacityLimit,
     IsolatedCapacity,
+    // The selected source had SSD-only content that could not be read back: the tier is
+    // disabled or failed the read, or Host could not hold the complete restore destination.
+    ColdUnavailable,
+    // The SSD copy of the selected source failed its checksum; the copy was discarded.
+    ColdChecksum,
 };
 
 struct GenerationAdmissionStats {
@@ -1058,6 +1079,14 @@ struct RuntimeStats {
 
     std::uint64_t pressure_spill_pages             = 0;
     std::uint64_t partial_tail_cow_pages           = 0;
+    // Checkpoints erased by Device or Host reclaim; with the SSD tier it includes the Device
+    // releases that never reach Host as well as cold_erased_checkpoints.
+    std::uint64_t reclaim_erased_checkpoints       = 0;
+    // Device-pressure share of reclaim_erased_checkpoints: release actions chosen when no
+    // demotion ranked first or could start (with the SSD tier, the fallback deletion).
+    std::uint64_t reclaim_device_erased_checkpoints = 0;
+    // Device-pressure demotions whose Host victims the SSD tier took whole instead of erasing.
+    std::uint64_t reclaim_spilled_demotions = 0;
     std::uint32_t device_state_occupied_slots      = 0;
     std::uint32_t host_state_occupied_slots        = 0;
     std::uint32_t device_main_kv_occupied_pages    = 0;
@@ -1069,6 +1098,58 @@ struct RuntimeStats {
     // Allocator lifetime high-water mark, including reserved transfer destinations.
     std::size_t host_context_peak_occupied_bytes = 0;
     double actual_context_transfer_seconds       = 0.0;
+
+    // SSD context tier (ContextCacheOptions::cold_directory). All zero when not configured.
+    // Occupancy counts objects holding an SSD copy; cold-only objects have no other replica.
+    bool cold_enabled                            = false;
+    bool cold_disabled                           = false;
+    std::uint64_t cold_capacity_bytes            = 0;
+    std::uint64_t cold_segment_bytes             = 0;
+    std::uint64_t cold_occupied_bytes            = 0;
+    std::uint64_t cold_main_kv_pages             = 0;
+    std::uint64_t cold_backend_kv_pages          = 0;
+    std::uint64_t cold_states                    = 0;
+    std::uint32_t cold_only_main_kv_pages        = 0;
+    std::uint32_t cold_only_backend_kv_pages     = 0;
+    std::uint32_t cold_only_states               = 0;
+    // Bytes issued to the file system; writes include the startup probe.
+    std::uint64_t cold_write_bytes               = 0;
+    std::uint64_t cold_read_bytes                = 0;
+    std::uint64_t cold_write_bytes_24h           = 0;
+    std::uint64_t cold_write_failures            = 0;
+    std::uint64_t cold_read_failures             = 0;
+    std::uint64_t cold_inflight_write_bytes      = 0;
+    std::uint64_t cold_inflight_read_bytes       = 0;
+    std::uint32_t cold_segments                  = 0;
+    std::uint32_t cold_jobs                      = 0;
+    std::uint64_t cold_checksum_failures         = 0;
+    // Host-pressure victims written to the SSD before their Host replicas were released, the
+    // Host bytes released afterwards, and victims erased without an SSD copy while the tier is
+    // configured (spill refused, full, failed, or a path that cannot wait for a write).
+    std::uint64_t cold_spills_started            = 0;
+    std::uint64_t cold_spills_completed          = 0;
+    std::uint64_t cold_spills_failed             = 0;
+    std::uint64_t cold_spill_host_bytes_released = 0;
+    std::uint64_t cold_erased_checkpoints        = 0;
+    std::uint64_t cold_restores_started          = 0;
+    std::uint64_t cold_restores_completed        = 0;
+    std::uint64_t cold_restores_cancelled        = 0;
+    std::uint64_t cold_restores_failed           = 0;
+    std::uint64_t cold_lost_checkpoints          = 0;
+    std::uint64_t cold_restore_bytes             = 0;
+    double cold_restore_seconds                  = 0.0;
+    double cold_probe_write_bytes_per_second     = 0.0;
+    double cold_probe_read_bytes_per_second      = 0.0;
+    // Policy: configured window and watermark; victims erased by the age rule (a subset of
+    // cold_erased_checkpoints); SSD-full evictions of older SSD content and their SSD bytes;
+    // pre-written checkpoints and those erased or evicted before a demotion used the copy.
+    std::uint32_t cold_demote_window_seconds      = 0;
+    std::uint32_t cold_prewrite_watermark_percent = 0;
+    std::uint64_t cold_expired_erasures           = 0;
+    std::uint64_t cold_evictions                  = 0;
+    std::uint64_t cold_evicted_bytes              = 0;
+    std::uint64_t cold_prewrites                  = 0;
+    std::uint64_t cold_prewrite_wasted            = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

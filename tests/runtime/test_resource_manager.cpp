@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <optional>
@@ -607,6 +608,169 @@ void test_host_preflight_counts_aliases_and_has_no_partial_deletion() {
     require(f.cache.erase(f.program, second) &&
                 f.program.physical_usage().occupied.host_bytes == 16,
             "last alias did not release its physical bytes");
+}
+
+enum class Disposal : std::uint8_t { Pending, Released, Erase };
+
+void test_host_victim_policy_takes_victims_before_erasure() {
+    using ninfer::runtime::ReclaimProgress;
+    Fixture f(64);
+    const auto old   = f.program.add({1}, {f.program.host_block(32)});
+    const auto young = f.program.add({2}, {f.program.host_block(32)});
+    f.publish(old);
+    f.publish(young);
+    auto mode         = Disposal::Pending;
+    bool pending      = false;
+    std::size_t calls = 0;
+    std::vector<Handle> disposed;
+    f.cache.set_host_victim_policy(
+        {.dispose =
+             [&](Program&, std::span<const Handle> victims) {
+                 ++calls;
+                 disposed.assign(victims.begin(), victims.end());
+                 pending = mode == Disposal::Pending;
+                 Fixture::Cache::HostVictimDisposal result{.pending = pending};
+                 if (mode == Disposal::Erase) { result.erase = disposed; }
+                 return result;
+             },
+         .pending = [&] { return pending; }});
+    auto cursor = f.cache.begin_reclaim(f.program);
+    require(f.cache.reclaim(f.program, {.host_bytes = 16}, {}, cursor) ==
+                    ReclaimProgress::Spilling &&
+                calls == 1 && disposed == std::vector<Handle>({old}) &&
+                f.program.released.empty() && f.program.valid_checkpoint(old),
+            "Host reclaim erased its oldest victim instead of handing it to the policy");
+    require(f.cache.reclaim(f.program, {.host_bytes = 16}, {}, cursor) ==
+                    ReclaimProgress::Spilling &&
+                calls == 1 && f.program.released.empty(),
+            "Host reclaim selected more victims while a disposed batch was pending");
+    pending = false;
+    mode    = Disposal::Released;
+    require(f.cache.reclaim(f.program, {.host_bytes = 16}, {}, cursor) ==
+                    ReclaimProgress::Changed &&
+                calls == 2 && f.program.released.empty() && f.program.valid_checkpoint(old) &&
+                f.cache.reclaim_erasures() == 0,
+            "a policy release erased the checkpoint it kept as a lower-tier source");
+    mode = Disposal::Erase;
+    require(f.cache.reclaim(f.program, {.host_bytes = 16}, {}, cursor) ==
+                    ReclaimProgress::Changed &&
+                calls == 3 && f.program.released == std::vector<Handle>({old}) &&
+                f.cache.reclaim_erasures() == 1 && f.cache.device_release_erasures() == 0,
+            "a refused policy did not fall back to the counted erasure");
+}
+
+// Age rule with an injected wall clock. `recent` is older in retention order (published first)
+// but younger in real demand; the policy's window makes the expired one the first victim.
+void test_age_rule_takes_expired_victims_first() {
+    using namespace std::chrono_literals;
+    using Clock = Fixture::Cache::WallClock;
+    const auto base = Clock::time_point{} + 100000s;
+    const auto setup = [&](Fixture& f, Clock::time_point& now) {
+        f.cache.set_wall_clock([&now] { return now; });
+        const auto recent = f.program.add({1}, {f.program.host_block(32)});
+        const auto old    = f.program.add({2}, {f.program.host_block(32)});
+        now               = base + 900s;
+        f.publish(recent);
+        now = base;
+        f.publish(old);
+        now = base + 1000s;
+        return std::pair{recent, old};
+    };
+    {
+        Fixture f(64);
+        Clock::time_point now;
+        const auto [recent, old] = setup(f, now);
+        require(f.cache.idle_for(old) == 1000s && f.cache.idle_for(recent) == 100s,
+                "wall-clock idle time does not follow the latest real demand");
+        require(!f.cache.expired(old), "a victim expired without an installed age rule");
+        auto cursor = f.cache.begin_reclaim(f.program);
+        require(f.cache.reclaim(f.program, {.host_bytes = 16}, {}, cursor) ==
+                        ninfer::runtime::ReclaimProgress::Changed &&
+                    f.program.released == std::vector<Handle>{recent},
+                "without a policy the wall clock changed the retention order");
+    }
+    {
+        Fixture f(64);
+        Clock::time_point now;
+        const auto [recent, old] = setup(f, now);
+        std::vector<Handle> disposed;
+        std::size_t expired_erased = 0;
+        f.cache.set_host_victim_policy(
+            {.dispose =
+                 [&](Program&, std::span<const Handle> victims) {
+                     disposed.assign(victims.begin(), victims.end());
+                     Fixture::Cache::HostVictimDisposal result;
+                     for (const auto victim : victims) {
+                         if (f.cache.expired(victim)) {
+                             result.erase.push_back(victim);
+                             ++expired_erased;
+                         }
+                     }
+                     return result;
+                 },
+             .erased =
+                 [&](Program&, std::span<const Handle> victims) {
+                     std::vector<Handle> out;
+                     for (const auto victim : victims) {
+                         if (f.cache.expired(victim)) { out.push_back(victim); }
+                     }
+                     return out;
+                 },
+             .pending       = [] { return false; },
+             .demote_window = std::chrono::nanoseconds(600s)});
+        require(f.cache.expired(old) && !f.cache.expired(recent),
+                "the age rule misclassified victims around its window");
+        auto cursor = f.cache.begin_reclaim(f.program);
+        require(f.cache.reclaim(f.program, {.host_bytes = 16}, {}, cursor) ==
+                        ninfer::runtime::ReclaimProgress::Changed &&
+                    disposed == std::vector<Handle>{old} && expired_erased == 1 &&
+                    f.program.released == std::vector<Handle>{old} &&
+                    f.program.valid_checkpoint(recent),
+                "the expired victim was not taken first and erased on demand");
+    }
+}
+
+// A hit refreshes real demand: the reused history is no longer past the window.
+void test_age_rule_hit_refreshes_demand() {
+    using namespace std::chrono_literals;
+    using Clock = Fixture::Cache::WallClock;
+    Fixture f(64);
+    auto now = Clock::time_point{} + 100000s;
+    f.cache.set_wall_clock([&now] { return now; });
+    f.cache.set_host_victim_policy(
+        {.pending = [] { return false; }, .demote_window = std::chrono::nanoseconds(600s)});
+    const auto history = f.program.add({1}, {f.program.host_block(32)});
+    f.publish(history);
+    now += 1000s;
+    require(f.cache.expired(history), "an idle history did not expire");
+    f.use_shared(history);
+    require(!f.cache.expired(history) && f.cache.idle_for(history) == 0s,
+            "a hit did not refresh the history's real demand");
+    now += 599s;
+    require(!f.cache.expired(history), "a history expired inside its window");
+    now += 2s;
+    require(f.cache.expired(history), "a history did not expire after its window");
+}
+
+// A running request keeps the history it carries in use even though it has not published.
+void test_age_rule_active_owner_is_not_idle() {
+    using namespace std::chrono_literals;
+    using Clock = Fixture::Cache::WallClock;
+    Fixture f(64);
+    auto now = Clock::time_point{} + 100000s;
+    f.cache.set_wall_clock([&now] { return now; });
+    f.cache.set_host_victim_policy(
+        {.pending = [] { return false; }, .demote_window = std::chrono::nanoseconds(600s)});
+    const auto history = f.program.add({1, 2}, {f.program.host_block(16)}, Role::Continuation);
+    const auto owner   = f.publish(history);
+    const Base next{.tokens = {1, 2, 3}};
+    const auto choice = f.source(next, history);
+    require(choice.take_over && choice.owner == owner, "fixture could not take over the owner");
+    const auto active = f.cache.adopt(f.program, choice, next, 20, {}, {&history, 1});
+    now += 1000s;
+    require(f.cache.idle_for(history) == 0s && !f.cache.expired(history),
+            "a running request's carried history was judged idle");
+    f.cache.abandon(f.program, active);
 }
 
 void test_candidates_keep_all_frontiers_and_independent_contents() {
@@ -1447,7 +1611,9 @@ void test_optional_capture_budget_spans_host_and_device_actions() {
     const auto host_victims = f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision);
     require(host_victims && *host_victims == std::vector<Handle>{host},
             "first Host action did not fit optional capture's recovery budget");
-    f.cache.commit_host_victims(f.program, *host_victims, decision);
+    require(f.cache.commit_host_victims(f.program, *host_victims, decision) ==
+                    ninfer::runtime::ReclaimProgress::Changed,
+            "Host victims without a disposal policy were not erased");
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, decision) ==
                     ninfer::runtime::ReclaimProgress::Blocked &&
                 f.program.valid_checkpoint(device),
@@ -1557,6 +1723,85 @@ void test_demotion_competes_with_its_actual_host_recovery_loss() {
                 !f.program.valid_checkpoint(device) && f.program.valid_checkpoint(host) &&
                 f.program.valid_checkpoint(movable) && f.program.demoted.empty(),
             "zero-loss Device quote hid a more expensive Host history deletion");
+}
+
+// The ranking of test_demotion_competes_with_its_actual_host_recovery_loss with an SSD tier: a
+// Host victim the tier takes whole is no loss, so the Device-only history is demoted instead of
+// erased. A tier that would erase the victim leaves the original ranking unchanged.
+void test_lower_tier_quote_ranks_demotion_ahead_of_device_erasure() {
+    using ninfer::runtime::ReclaimProgress;
+    const auto setup = [](Fixture& f) {
+        const auto movable                               = f.program.add(tokens(2000));
+        f.program.contents[movable.index].demotion_bytes = 32;
+        const auto device                                = f.program.add(tokens(500, 10000));
+        const auto host = f.program.add(tokens(1000, 20000), {f.program.host_block(32)});
+        f.program.contents[host.index].device_state = false;
+        f.publish(movable);
+        f.publish(device);
+        f.publish(host);
+        return std::array{movable, device, host};
+    };
+    {
+        Fixture f(32);
+        const auto [movable, device, host] = setup(f);
+        bool pending                       = false;
+        std::size_t quotes                 = 0;
+        std::vector<Handle> disposed;
+        f.cache.set_host_victim_policy(
+            {.dispose =
+                 [&](Program&, std::span<const Handle> victims) {
+                     disposed.assign(victims.begin(), victims.end());
+                     pending = true;
+                     return Fixture::Cache::HostVictimDisposal{.pending = true};
+                 },
+             .erased =
+                 [&](Program&, std::span<const Handle>) {
+                     ++quotes;
+                     return std::vector<Handle>{};
+                 },
+             .pending = [&] { return pending; }});
+        require(f.cache.reclaim(f.program, {.state_slots = 1}) == ReclaimProgress::Spilling &&
+                    quotes != 0 && disposed == std::vector<Handle>{host} &&
+                    f.program.valid_checkpoint(device) && f.program.valid_checkpoint(host) &&
+                    f.program.valid_checkpoint(movable) && f.program.released.empty(),
+                "a Host victim the lower tier takes whole still outranked the demotion");
+        require(f.cache.spilled_demotions() == 1 && f.cache.device_release_erasures() == 0 &&
+                    f.cache.reclaim_erasures() == 0,
+                "the demotion that spilled its Host victim was not counted");
+        require(f.program.demoted.empty(), "the demotion started before its Host destination");
+        // While that batch is being written the demotion cannot start, and the Device erasure
+        // ranked after it must wait for the batch instead of deleting what it makes room for.
+        require(f.cache.reclaim(f.program, {.state_slots = 1}) == ReclaimProgress::Spilling &&
+                    f.program.valid_checkpoint(device) && f.program.valid_checkpoint(host) &&
+                    f.program.released.empty() && f.cache.device_release_erasures() == 0 &&
+                    f.cache.reclaim_erasures() == 0,
+                "a Device erasure ran while the batch it waits for was still being written");
+    }
+    {
+        Fixture f(32);
+        const auto [movable, device, host] = setup(f);
+        std::size_t disposals              = 0;
+        f.cache.set_host_victim_policy(
+            {.dispose =
+                 [&](Program&, std::span<const Handle> victims) {
+                     ++disposals;
+                     return Fixture::Cache::HostVictimDisposal{
+                         .erase = std::vector<Handle>(victims.begin(), victims.end())};
+                 },
+             .erased =
+                 [&](Program&, std::span<const Handle> victims) {
+                     return std::vector<Handle>(victims.begin(), victims.end());
+                 },
+             .pending = [] { return false; }});
+        require(f.cache.reclaim(f.program, {.state_slots = 1}) == ReclaimProgress::Changed &&
+                    disposals == 0 && !f.program.valid_checkpoint(device) &&
+                    f.program.valid_checkpoint(host) && f.program.valid_checkpoint(movable) &&
+                    f.program.demoted.empty(),
+                "a lower tier that erases the victim changed the Device ranking");
+        require(f.cache.device_release_erasures() == 1 && f.cache.spilled_demotions() == 0 &&
+                    f.cache.reclaim_erasures() == 1,
+                "the Device-pressure fallback deletion was not counted");
+    }
 }
 
 void test_adjacent_kv_demotions_share_one_submission() {
@@ -1900,6 +2145,11 @@ int main() {
         test_fallback_requires_surviving_compatible_earlier_history();
         test_optional_capture_does_not_inherit_required_eviction_rights();
         test_physical_host_alias_uses_all_holders_priority();
+        test_host_victim_policy_takes_victims_before_erasure();
+        test_lower_tier_quote_ranks_demotion_ahead_of_device_erasure();
+        test_age_rule_takes_expired_victims_first();
+        test_age_rule_hit_refreshes_demand();
+        test_age_rule_active_owner_is_not_idle();
         test_committed_repeated_demand_admits_a_new_short_working_set();
         test_cold_writeback_protects_reused_history();
         test_host_preflight_counts_aliases_and_has_no_partial_deletion();

@@ -208,6 +208,9 @@ struct RequestRecord {
     std::uint64_t preemption_count         = 0;
     std::uint64_t replay_restores          = 0;
     std::uint64_t snapshot_restores        = 0;
+    std::uint64_t cold_restores            = 0;
+    std::uint64_t cold_to_host_bytes       = 0;
+    std::uint64_t cold_restore_wait_ns     = 0;
     std::uint64_t replayed_tokens          = 0;
     std::uint64_t paused_ns                = 0;
     std::optional<Clock::time_point> paused_at;

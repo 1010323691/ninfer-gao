@@ -207,6 +207,11 @@ Snapshot/Replay recovery and cancellation while paused or replaying; `NINFER_PRE
 selects `all`, `snapshot`, `replay`, `cancel-paused` or `cancel-replay`. Native transaction tests cover
 physical state/KV ownership, binding, capture, reclamation and abort; their positional backend is
 `none`, `mtp`, `dflash` or `dflash2`. Each backend requires an artifact containing that component.
+SSD context tier tests (`ninfer_cold_context_store_test`, `ninfer_qwen3_5_cold_tier_test`,
+`ninfer_qwen3_5_cold_engine_real_test`, `ninfer_qwen3_5_cold_policy_real_test`) need a real NVMe-backed
+directory: RAM-backed or `O_DIRECT`-less directories (for example `/tmp`) are refused. Set
+`NINFER_TEST_COLD_DIR` (or pass the directory as the first argument); each test creates and removes
+only its own subdirectory below it. The real-model ones also need `NINFER_TEST_ARTIFACT`.
 Public-HTTP latency and output gaps are measured separately by the
 [TTFT campaign](../tools/bench/ttft/README.md).
 

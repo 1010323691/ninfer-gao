@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/cold_context_store.h"
 #include "core/paged_kv_cache.h"
 
 #include <algorithm>
@@ -37,6 +38,14 @@ private:
     std::uint32_t generation_       = 0;
 
     friend class HostKVExtentStore;
+};
+
+// SSD copy of one full page. It is valid only for the content identity it was written from.
+struct ColdPageReplica {
+    ColdSlot slot;
+    std::uint64_t content_epoch     = 0;
+    std::uint32_t committed_columns = 0;
+    std::uint32_t checksum          = 0;
 };
 
 struct HostKVPageReplica {
@@ -87,6 +96,13 @@ public:
     LogicalKVPageStore& operator=(const LogicalKVPageStore&) = delete;
     LogicalKVPageStore(LogicalKVPageStore&&)                 = delete;
     LogicalKVPageStore& operator=(LogicalKVPageStore&&)      = delete;
+
+    // The cold store releases slots of descriptors that retire or change content. Cold-only pages
+    // (no Device or Host replica) are bounded by the descriptor allowance added for the tier.
+    void attach_cold_store(ColdContextStore* store, std::uint32_t cold_only_limit) noexcept {
+        cold_            = store;
+        cold_only_limit_ = store ? cold_only_limit : 0;
+    }
 
     [[nodiscard]] DeviceKVPagePool& physical_pool() noexcept { return *physical_; }
 
@@ -308,6 +324,7 @@ public:
         page.device_replica = std::move(page.pending_device_replica);
         page.pending_device_replica.reset();
         page.destination_pinned = false;
+        sync_cold_only(page);
     }
 
     void abort_device_replica(LogicalKVPageHandle handle,
@@ -324,6 +341,7 @@ public:
         if (!can_drop_device_replica(handle)) { return false; }
         Page& page = pages_[handle.index_];
         page.device_replica.reset();
+        sync_cold_only(page);
         return true;
     }
 
@@ -332,6 +350,96 @@ public:
         const Page& page = pages_[handle.index_];
         return page.host_replica && page.host_replica->content_epoch == page.content_epoch &&
                page.host_replica->committed_columns == page.committed_columns;
+    }
+
+    [[nodiscard]] bool cold_replica_current(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return page.cold_replica && page.cold_replica->content_epoch == page.content_epoch &&
+               page.cold_replica->committed_columns == page.committed_columns;
+    }
+
+    [[nodiscard]] const ColdPageReplica* cold_replica(LogicalKVPageHandle handle) const {
+        const Page& page = require(handle);
+        return page.cold_replica ? &*page.cold_replica : nullptr;
+    }
+
+    [[nodiscard]] bool cold_busy(LogicalKVPageHandle handle) const {
+        return require(handle).cold_busy;
+    }
+
+    // Only the SSD copy remains; restoring it to Host must precede any Device use.
+    [[nodiscard]] bool cold_only(LogicalKVPageHandle handle) const {
+        const Page& page = require(handle);
+        return !page.device_replica && !page.host_replica && page.cold_replica.has_value();
+    }
+
+    [[nodiscard]] bool has_replica(LogicalKVPageHandle handle) const {
+        const Page& page = require(handle);
+        return page.device_replica || page.host_replica || page.cold_replica;
+    }
+
+    [[nodiscard]] std::uint32_t cold_only_pages() const noexcept { return cold_only_count_; }
+
+    [[nodiscard]] std::uint32_t cold_only_limit() const noexcept { return cold_only_limit_; }
+
+    // A committed page whose Host replica is current can be copied to the SSD once, as a
+    // whole-page object that records its committed columns. A partial tail qualifies only while
+    // no writer can extend it: a checkpoint's tail is then immutable for that checkpoint. An
+    // extension after the copy started changes the columns and the completion discards the copy.
+    [[nodiscard]] bool can_spill(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle) || cold_ == nullptr) { return false; }
+        const Page& page = pages_[handle.index_];
+        return !page.cold_busy && !page.cold_replica && page.committed_columns != 0 &&
+               (page.committed_columns == static_cast<std::uint32_t>(kPagedKVPageSize) ||
+                page.writer_references == 0) &&
+               host_replica_current(handle);
+    }
+
+    // One outstanding SSD transfer pins the page: its Host source (spill) or reserved Host
+    // destination (restore) cannot be released, and its cold slot cannot change.
+    void set_cold_busy(LogicalKVPageHandle handle, bool busy) {
+        Page& page = require(handle);
+        if (page.cold_busy == busy) { throw std::logic_error("logical KV cold pin is unbalanced"); }
+        page.cold_busy = busy;
+    }
+
+    void attach_cold_replica(LogicalKVPageHandle handle, ColdPageReplica replica) {
+        Page& page = require(handle);
+        if (cold_ == nullptr || page.cold_replica || !replica.slot.valid() ||
+            replica.content_epoch != page.content_epoch ||
+            replica.committed_columns != page.committed_columns) {
+            throw std::logic_error("logical KV cold replica is not publishable");
+        }
+        page.cold_replica = replica;
+        sync_cold_only(page);
+    }
+
+    // Releases a redundant SSD copy. A cold-only page keeps its last replica.
+    [[nodiscard]] bool drop_cold_replica(LogicalKVPageHandle handle) {
+        if (!valid(handle)) { return false; }
+        Page& page = pages_[handle.index_];
+        if (!page.cold_replica || page.cold_busy || (!page.device_replica && !page.host_replica)) {
+            return false;
+        }
+        release_cold(page);
+        return true;
+    }
+
+    // An unreadable SSD copy is discarded even when it was the last replica; the page then has no
+    // content and every checkpoint covering it is unrecoverable.
+    void invalidate_cold_replica(LogicalKVPageHandle handle) {
+        Page& page = require(handle);
+        if (page.cold_busy) { throw std::logic_error("busy cold replica cannot be invalidated"); }
+        if (page.cold_replica) { release_cold(page); }
+    }
+
+    // Whether removing the Host replica keeps the page's content in another current replica.
+    [[nodiscard]] bool host_release_preserves(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return !page.cold_busy &&
+               (page.device_replica || page.references == 0 || cold_replica_current(handle));
     }
 
     [[nodiscard]] bool can_drop_device_replica(LogicalKVPageHandle handle) const noexcept {
@@ -431,7 +539,11 @@ public:
             columns > static_cast<std::uint32_t>(kPagedKVPageSize)) {
             throw std::invalid_argument("logical KV committed coverage is not monotonic");
         }
+        if (columns == page.committed_columns) { return; }
         page.committed_columns = columns;
+        // An SSD copy of the shorter tail can never become current again. A copy still being
+        // written is discarded by its completion instead.
+        if (!page.cold_busy) { retire_stale_cold(page); }
     }
 
     void destructive_truncate(LogicalKVPageHandle handle, std::uint32_t columns) {
@@ -444,6 +556,7 @@ public:
         if (columns != page.committed_columns) {
             page.committed_columns = columns;
             page.content_epoch     = next_epoch(page.content_epoch);
+            retire_stale_cold(page);
         }
     }
 
@@ -483,6 +596,7 @@ public:
         if (columns != page.committed_columns) {
             page.committed_columns = columns;
             page.content_epoch     = next_epoch(page.content_epoch);
+            retire_stale_cold(page);
         }
         page.protected_columns = std::min(page.protected_columns, columns);
     }
@@ -523,6 +637,7 @@ public:
         if (writer) { page.writer_references = 0; }
         if (--page.references != 0) { return true; }
         page.device_replica.reset();
+        sync_cold_only(page);
         // A Host extent owns its page capability until the extent is released as one atomic
         // allocation. Keep the zero-reference logical descriptor alive long enough for
         // HostKVExtentStore to detach that replica; without a Host replica the descriptor can be
@@ -547,6 +662,7 @@ public:
             throw std::logic_error("logical KV Host replica is not publishable");
         }
         page.host_replica = replica;
+        sync_cold_only(page);
     }
 
     void rebind_host_replica(LogicalKVPageHandle handle, HostKVPageReplica expected,
@@ -572,10 +688,11 @@ public:
         if (!valid(handle)) { return false; }
         Page& page = pages_[handle.index_];
         if (!page.host_replica || page.host_replica->extent != extent ||
-            (!page.device_replica && page.references != 0)) {
+            !host_release_preserves(handle)) {
             return false;
         }
         page.host_replica.reset();
+        sync_cold_only(page);
         if (page.references == 0 && page.source_pins == 0 && !page.device_replica) {
             release_descriptor(handle, page);
         }
@@ -614,6 +731,9 @@ private:
         std::optional<DeviceKVPageLease> device_replica;
         std::optional<DeviceKVPageLease> pending_device_replica;
         std::optional<HostKVPageReplica> host_replica;
+        std::optional<ColdPageReplica> cold_replica;
+        bool cold_busy         = false;
+        bool counted_cold_only = false;
     };
 
     [[nodiscard]] static std::uint64_t next_epoch(std::uint64_t epoch) noexcept {
@@ -631,8 +751,39 @@ private:
         return pages_[handle.index_];
     }
 
+    void sync_cold_only(Page& page) noexcept {
+        const bool now = page.occupied && !page.device_replica && !page.host_replica &&
+                         page.cold_replica.has_value();
+        if (now == page.counted_cold_only) { return; }
+        page.counted_cold_only = now;
+        if (now) {
+            ++cold_only_count_;
+        } else {
+            --cold_only_count_;
+        }
+    }
+
+    void release_cold(Page& page) noexcept {
+        if (!page.cold_replica) { return; }
+        if (page.cold_busy || cold_ == nullptr) { std::terminate(); }
+        try {
+            cold_->release(page.cold_replica->slot);
+        } catch (...) { std::terminate(); }
+        page.cold_replica.reset();
+        sync_cold_only(page);
+    }
+
+    // Content changed: an SSD copy of the old identity can never become current again.
+    void retire_stale_cold(Page& page) noexcept {
+        if (page.cold_replica && (page.cold_replica->content_epoch != page.content_epoch ||
+                                  page.cold_replica->committed_columns != page.committed_columns)) {
+            release_cold(page);
+        }
+    }
+
     void release_descriptor(LogicalKVPageHandle handle, Page& page) noexcept {
-        if (page.active_references != 0) { std::terminate(); }
+        if (page.active_references != 0 || page.cold_busy) { std::terminate(); }
+        release_cold(page);
         page.committed_columns  = 0;
         page.references         = 0;
         page.active_references  = 0;
@@ -643,6 +794,7 @@ private:
         page.occupied           = false;
         page.pending_device_replica.reset();
         page.host_replica.reset();
+        sync_cold_only(page);
         if (++page.generation == 0) { ++page.generation; }
         free_[free_count_++] = handle.index_;
     }
@@ -651,6 +803,9 @@ private:
     std::vector<Page> pages_;
     std::vector<std::uint32_t> free_;
     std::vector<DeviceKVPageLease> materialization_scratch_;
-    std::uint32_t free_count_ = 0;
+    std::uint32_t free_count_      = 0;
+    ColdContextStore* cold_        = nullptr;
+    std::uint32_t cold_only_limit_ = 0;
+    std::uint32_t cold_only_count_ = 0;
 };
 } // namespace ninfer::models::qwen3_5::detail

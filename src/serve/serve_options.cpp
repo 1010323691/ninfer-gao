@@ -122,6 +122,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-context-mib N] "
+           "[--ssd-context-dir PATH] [--ssd-context-gib N] "
+           "[--ssd-context-demote-window-seconds N] [--ssd-context-watermark-percent N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
@@ -156,6 +158,15 @@ std::string serve_usage_text(const char* argv0) {
            "       --device-state-slots is extra capacity beyond active lanes; "
            "--host-context-mib bounds shared Host State/KV and in-flight storage in MiB\n"
            "       --host-context-mib accepts decimal MiB values that resolve to whole bytes\n"
+           "       --ssd-context-dir enables a process-volatile SSD tier below Host context: "
+           "startup clears its segment files and rejects RAM-backed or slow directories; "
+           "it requires prefix reuse and nonzero Host context\n"
+           "       --ssd-context-gib bounds the SSD tier files (default 100, requires "
+           "--ssd-context-dir); the file system needs that much free space plus 1 GiB\n"
+           "       --ssd-context-demote-window-seconds (default 600) erases Host victims idle "
+           "longer, oldest first, instead of writing them to the SSD\n"
+           "       --ssd-context-watermark-percent (default 10, 0 disables, at most 90) pre-writes "
+           "victims inside the window to the SSD while free Host context is below it\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -179,6 +190,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
+    bool ssd_capacity_explicit       = false;
+    bool ssd_policy_explicit         = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -262,6 +275,38 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--host-context-mib") {
             options.context_cache.host_capacity_bytes =
                 parse_host_context_mib(require_value("--host-context-mib"));
+        } else if (arg == "--ssd-context-dir") {
+            options.context_cache.cold_directory = require_value("--ssd-context-dir");
+            if (options.context_cache.cold_directory.empty()) {
+                throw std::invalid_argument("--ssd-context-dir must not be empty");
+            }
+        } else if (arg == "--ssd-context-gib") {
+            const std::uint64_t gib =
+                parse_u64(require_value("--ssd-context-gib"), "ssd-context-gib");
+            if (gib == 0 || gib > (std::numeric_limits<std::uint64_t>::max() >> 30U)) {
+                throw std::invalid_argument("--ssd-context-gib is out of range");
+            }
+            options.context_cache.cold_capacity_bytes = gib << 30U;
+            ssd_capacity_explicit                     = true;
+        } else if (arg == "--ssd-context-demote-window-seconds") {
+            const int seconds = parse_nonnegative_int(
+                require_value("--ssd-context-demote-window-seconds"),
+                "ssd-context-demote-window-seconds");
+            if (seconds == 0) {
+                throw std::invalid_argument("--ssd-context-demote-window-seconds must be positive");
+            }
+            options.context_cache.cold_demote_window_seconds = static_cast<std::uint32_t>(seconds);
+            ssd_policy_explicit                              = true;
+        } else if (arg == "--ssd-context-watermark-percent") {
+            const int percent =
+                parse_nonnegative_int(require_value("--ssd-context-watermark-percent"),
+                                      "ssd-context-watermark-percent");
+            if (percent > 90) {
+                throw std::invalid_argument("--ssd-context-watermark-percent must be at most 90");
+            }
+            options.context_cache.cold_prewrite_watermark_percent =
+                static_cast<std::uint32_t>(percent);
+            ssd_policy_explicit = true;
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
@@ -373,6 +418,21 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    }
+    if (ssd_capacity_explicit && options.context_cache.cold_directory.empty()) {
+        throw std::invalid_argument("--ssd-context-gib requires --ssd-context-dir");
+    }
+    if (ssd_policy_explicit && options.context_cache.cold_directory.empty()) {
+        throw std::invalid_argument(
+            "--ssd-context-demote-window-seconds and --ssd-context-watermark-percent require "
+            "--ssd-context-dir");
+    }
+    if (!options.context_cache.cold_directory.empty() && !options.allow_prefix_reuse) {
+        throw std::invalid_argument("--ssd-context-dir requires prefix reuse");
+    }
+    if (!options.context_cache.cold_directory.empty() &&
+        options.context_cache.host_capacity_bytes == 0) {
+        throw std::invalid_argument("--ssd-context-dir requires nonzero --host-context-mib");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (default_max_tokens_explicit) {

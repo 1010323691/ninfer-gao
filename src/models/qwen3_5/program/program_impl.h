@@ -1,7 +1,9 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
+#include "models/qwen3_5/program/context_work.h"
 
 #include "core/arena.h"
+#include "core/cold_context_store.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -23,11 +25,14 @@
 #include <algorithm>
 #include <cstdint>
 #include <array>
+#include <chrono>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -334,6 +339,32 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
+    [[nodiscard]] ColdUsage cold_usage() const;
+    [[nodiscard]] ColdQuote cold_quote(std::span<const CheckpointHandle>) const;
+    [[nodiscard]] ColdStart start_spill(std::span<const CheckpointHandle>);
+    [[nodiscard]] std::size_t release_cold_host(std::span<const CheckpointHandle>);
+    [[nodiscard]] ColdStart start_restore(CheckpointHandle);
+    [[nodiscard]] std::vector<ColdCompletion> poll_cold();
+    [[nodiscard]] bool cancel_cold(ColdJobId);
+    [[nodiscard]] std::uint64_t drop_cold(std::span<const CheckpointHandle>);
+    [[nodiscard]] std::optional<ColdJobId> cold_restore_job(CheckpointHandle) const;
+
+    // Residency of the State/KV covered by one checkpoint, as read by a binding.
+    enum class ColdResidency : std::uint8_t { Resident, ColdOnly, Lost };
+    [[nodiscard]] ColdResidency cold_residency(CheckpointHandle) const;
+    // For each KV page of these checkpoints, how many of them hold it (a page counts once per
+    // checkpoint). Compared with the page's address references it tells whether a holder outside
+    // the set still uses it.
+    [[nodiscard]] std::unordered_map<std::uint64_t, std::uint32_t>
+    victim_page_holders(std::span<const CheckpointHandle>) const;
+    // Visits the checkpoint's StateImage and the logical pages of each enabled KV pool within its
+    // recoverable coverage (MTP backend coverage ends one token before the Main frontier).
+    template <typename StateVisitor, typename PageVisitor>
+    void visit_checkpoint_objects(const CheckpointState& record, StateVisitor&& state,
+                                  PageVisitor&& page) const;
+    void finish_cold_job(ColdJobId, std::vector<ColdCompletion>&);
+    void submit_cold_objects(ColdJobId);
+    void shutdown_cold() noexcept;
 
     const execution::Parameters& parameters;
     DeviceContext& device;
@@ -357,6 +388,9 @@ public:
     DeviceArena workspace_storage;
     WorkspaceArena work;
     std::unique_ptr<qwen3_5::DecoderState> decoder;
+    // Declared before every store so it outlives descriptor releases during member destruction;
+    // ~ProgramImpl stops its I/O threads before Host memory is released.
+    std::unique_ptr<ColdContextStore> cold_store;
     std::unique_ptr<HostContextArena> host_context_arena;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
@@ -480,6 +514,46 @@ public:
     };
 
     std::optional<ContextTransaction> context_transaction_;
+
+    // One object (Main page, backend page or StateImage) moved by a cold job.
+    struct ColdObject {
+        runtime::ContextResourceClass resource = runtime::ContextResourceClass::State;
+        LogicalKVPageStore* pages              = nullptr;
+        LogicalKVPageHandle page;
+        StateImageHandle state;
+        ColdSlot slot;
+        std::byte* memory      = nullptr;
+        std::uint64_t ticket   = 0;
+        std::uint64_t bytes    = 0;
+        bool submitted         = false;
+        bool finished          = false;
+        ColdIoStatus status    = ColdIoStatus::Cancelled;
+        std::uint32_t checksum = 0;
+        // Spill: content identity captured at submission; a changed object is not attached.
+        std::uint64_t epoch   = 0;
+        std::uint32_t columns = 0;
+    };
+
+    // Spill jobs pin Host sources per object; restore jobs also pin their checkpoint and hold
+    // complete Host destinations. Neither is a context transaction: no GPU or Device resource.
+    struct ColdJob {
+        ColdJobKind kind = ColdJobKind::Spill;
+        std::vector<CheckpointHandle> checkpoints;
+        std::vector<CheckpointHandle> pinned;
+        std::vector<std::shared_ptr<KVHistory>> histories;
+        std::vector<ColdObject> objects;
+        std::vector<HostKVExtentReservation> extents;
+        std::optional<StateImageHandle> state_destination;
+        std::size_t next_submit = 0;
+        std::size_t outstanding = 0;
+        bool cancelled          = false;
+        std::chrono::steady_clock::time_point started;
+    };
+
+    std::map<ColdJobId, ColdJob> cold_jobs;
+    std::unordered_map<std::uint64_t, std::pair<ColdJobId, std::size_t>> cold_tickets_;
+    ColdJobId next_cold_job_       = 1;
+    std::uint64_t next_cold_ticket_ = 1;
     CudaCompletionEvent context_source_ready_;
     CudaCompletionEvent context_completion_;
     std::array<CudaEventTimer, 3> context_transfer_timers_;
@@ -599,4 +673,30 @@ public:
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
 };
+
+template <typename StateVisitor, typename PageVisitor>
+void ProgramImpl::visit_checkpoint_objects(const CheckpointState& record, StateVisitor&& state,
+                                           PageVisitor&& page) const {
+    state(record.state);
+    const auto visit = [&](const KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                           KVAddressSpaceHandle address, std::uint32_t frontier,
+                           runtime::ContextResourceClass resource) {
+        const auto count =
+            std::min(kv_pages_for_frontier(frontier), addresses.mapped_pages(address));
+        for (std::uint32_t index = 0; index < count; ++index) {
+            page(pages, addresses.logical_page(address, index), resource);
+        }
+    };
+    visit(*text_kv_addresses, *text_kv_pages, record.kv->text, record.frontier,
+          runtime::ContextResourceClass::MainKV);
+    if (record.kv->backend && backend_kv_pages) {
+        // Same coverage a binding reads (inspect_source): MTP through frontier-1.
+        const auto frontier = speculative_backend == SpeculativeBackend::Mtp && record.frontier
+                                  ? record.frontier - 1U
+                                  : record.backend_frontier;
+        visit(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend, frontier,
+              runtime::ContextResourceClass::BackendKV);
+    }
+}
+
 } // namespace ninfer::models::qwen3_5::detail

@@ -396,10 +396,31 @@ reserve destination
 Copy 进行时 source 与 destination 都被 pin。Copy 完成前，destination 不进入 address space 或 execution
 table；唯一有效 source 也不能先释放。
 
-### 5.5 Descriptor lifetime
+### 5.5 SSD replica
 
-Logical descriptor 不构成第三份 payload。它可以在 Device-only、Host-only 或 Both placements 下继续存在。
-只有当 references、replicas 和 transaction pins 均为零时，descriptor 才能回收并推进 generation。
+配置 SSD 冷层时，已提交的页可另有一个 SSD replica：一个整页大小的定长冷层槽与写入时的
+`content epoch + committed columns` 及校验和。它只从当前 Host replica 写出（spill），只读回 Host
+（restore），不直接成为 Device 的来源。
+
+- 有效性与 Host replica 相同：epoch 或 committed coverage 变化后 SSD replica 作废并释放槽
+  （`commit_coverage` 续写尾页时释放，写入中的副本由完成时的列数核对丢弃）；满页不可变，所以写成后
+  长期有效。
+- partial tail 在没有 writer 时可以落盘：此时它对持有它的检查点不可变，副本按整页写出并记录列数，
+  读回后恢复同样的 committed columns。有 writer 的尾页不落盘。
+- 共享页是同一个 logical page，SSD replica 天然只写一份；COW 与增长得到的新页不继承它。
+- 检查点按整体降级：只有它在 Host 上的每个对象都有当前 SSD replica 时才释放这些对象的 Host replica；
+  仅 Device replica 的对象（如共享前缀页）留在 Device，不参与也不阻塞。
+- 被非受害者检查点仍引用的页，在受害者降级时保留 Host replica（与 SSD replica 并存），其他持有者不会
+  因此变为仅冷；页落盘一次，之后由最后一个持有者的降级释放 Host replica。
+- SSD 传输期间页被 cold pin，Host 源或预留的 Host 目的都不能释放。
+- 读回校验失败的 SSD replica 被丢弃，即使它是最后一个 replica；覆盖该页的检查点不再可恢复。
+- 仅 SSD replica 的页数受启动时为冷层加入的描述符额度约束。
+
+### 5.6 Descriptor lifetime
+
+Logical descriptor 不构成额外 payload。它可以在 Device、Host、SSD replica 的任意非空组合下继续存在。
+只有当 references、replicas、transaction pins 与 cold pin 均为零时，descriptor 才能回收并推进
+generation，同时释放其 SSD 槽。
 
 ---
 
@@ -700,7 +721,7 @@ consumer，且 replay in-flight期间不得改写同一 row。
 6. Valid frontier精确到token；page boundary不改变Attention或checkpoint语义。
 7. Published checkpoint所需coverage不可被writer覆盖；任一logical page至多一个writer。
 8. Shared full pages immutable；non-aligned writable tail先建立private COW page。
-9. Host/Device replacement在copy与epoch/coverage验证完成后才发布。
+9. Host/Device replacement在copy与epoch/coverage验证完成后才发布；SSD replica只在写入完成后发布，读回在校验通过后才发布Host replica。
 10. 普通 unit 结算归还未用容量；恢复 reservation 跨 chunk 保留至真实新进展或终态。
 11. 一个GPU execution unit内membership、block tables、replicas与read frontier稳定。
 12. Inactive address space不占execution row；execution row不拥有logical pages。
@@ -722,6 +743,8 @@ consumer，且 replay in-flight期间不得改写同一 row。
 | address spaces、目录与 views | `src/models/qwen3_5/program/storage/kv_address_space.h` |
 | history 与 checkpoint 生命周期 | `src/models/qwen3_5/program/storage/checkpoints.cpp`, `sequence.cpp` |
 | Host extent membership | `src/models/qwen3_5/program/storage/host_kv_store.h` |
+| SSD 冷层槽、段文件、I/O 与校验 | `src/core/cold_context_store.*`, `src/core/crc32c.*` |
+| SSD replica 的 spill/restore 机制 | `src/models/qwen3_5/program/transactions/cold.cpp` |
 | unit 许可与上下文事务 | `src/models/qwen3_5/program/planning/request_plan.cpp`, `transactions/` |
 | model pool layout与capacity curve | `src/models/qwen3_5/program/planning/startup.cpp` |
 | public paged consumer views | `src/core/paged_kv_cache.h` |

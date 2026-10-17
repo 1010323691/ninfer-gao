@@ -58,6 +58,11 @@ void validate_options(const EngineOptions& options) {
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
     }
+    if (!options.context_cache.cold_directory.empty() &&
+        (!options.context_cache.enabled || options.context_cache.cold_capacity_bytes == 0)) {
+        throw std::invalid_argument(
+            "the SSD context tier requires context history and a nonzero capacity");
+    }
 }
 
 std::size_t current_free_device_bytes() {
@@ -184,6 +189,11 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             throw std::runtime_error("automatic KV sizing could not preserve the requested "
                                      "headroom after measured CUDA startup allocations");
         }
+    }
+    if (instance->program->cold_enabled()) {
+        // The SSD read cost comes from the tier's own startup probe of its directory.
+        context_cost.model.cold_read = cold_read_transfer_cost(
+            instance->program->cold_usage().probe_read_bytes_per_second);
     }
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;

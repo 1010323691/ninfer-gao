@@ -201,6 +201,51 @@ int main() {
                           context_cache.context_cache.host_capacity_bytes == (64ULL << 20),
                       "context-cache capacities did not reach serving options");
 
+    const ServeOptions ssd_context = parse({"ninfer-serve", "model.ninfer", "--ssd-context-dir",
+                                            "/var/ninfer-ssd", "--ssd-context-gib", "12"});
+    failures += check(ssd_context.context_cache.cold_directory == "/var/ninfer-ssd" &&
+                          ssd_context.context_cache.cold_capacity_bytes == (12ULL << 30),
+                      "SSD context tier options did not reach serving options");
+    failures += check(defaults.context_cache.cold_directory.empty(),
+                      "the SSD context tier is enabled without --ssd-context-dir");
+    failures += check(defaults.context_cache.cold_demote_window_seconds == 600 &&
+                          defaults.context_cache.cold_prewrite_watermark_percent == 10,
+                      "SSD tier policy defaults changed");
+    const ServeOptions ssd_policy =
+        parse({"ninfer-serve", "model.ninfer", "--ssd-context-dir", "/var/ninfer-ssd",
+               "--ssd-context-demote-window-seconds", "20", "--ssd-context-watermark-percent",
+               "0"});
+    failures += check(ssd_policy.context_cache.cold_demote_window_seconds == 20 &&
+                          ssd_policy.context_cache.cold_prewrite_watermark_percent == 0,
+                      "SSD tier policy options did not reach serving options");
+    for (const char* invalid : {"0", "-1", "x"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--ssd-context-dir", "/var/ninfer-ssd",
+                         "--ssd-context-gib", invalid});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid --ssd-context-gib was accepted");
+    }
+    for (const std::vector<std::string>& invalid : std::vector<std::vector<std::string>>{
+             {"ninfer-serve", "model.ninfer", "--ssd-context-gib", "4"},
+             {"ninfer-serve", "model.ninfer", "--ssd-context-dir", "/var/ninfer-ssd",
+              "--no-prefix-reuse"},
+             {"ninfer-serve", "model.ninfer", "--ssd-context-dir", "/var/ninfer-ssd",
+              "--host-context-mib", "0"},
+             {"ninfer-serve", "model.ninfer", "--ssd-context-dir", ""},
+             {"ninfer-serve", "model.ninfer", "--ssd-context-demote-window-seconds", "20"},
+             {"ninfer-serve", "model.ninfer", "--ssd-context-watermark-percent", "5"},
+             {"ninfer-serve", "model.ninfer", "--ssd-context-dir", "/var/ninfer-ssd",
+              "--ssd-context-demote-window-seconds", "0"},
+             {"ninfer-serve", "model.ninfer", "--ssd-context-dir", "/var/ninfer-ssd",
+              "--ssd-context-watermark-percent", "91"}}) {
+        bool rejected = false;
+        try {
+            (void)parse(invalid);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an inconsistent SSD tier configuration was accepted");
+    }
+
     const ServeOptions zero_host_context =
         parse({"ninfer-serve", "model.ninfer", "--host-context-mib", "0"});
     failures += check(zero_host_context.context_cache.enabled &&

@@ -42,7 +42,11 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         }
     }
     if (!handle) { return candidate; }
-    const auto& record       = checkpoint(*handle);
+    const auto& record = checkpoint(*handle);
+    // Content without any replica cannot be bound; cold-only content is restored to Host first.
+    const auto residency = cold_residency(*handle);
+    if (residency == ColdResidency::Lost) { return std::nullopt; }
+    candidate.cold_restore   = residency == ColdResidency::ColdOnly;
     candidate.consume_source = consume_source;
     candidate.take_private   = consume_source;
     for (const auto point : retired_points) {
@@ -95,11 +99,12 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
         std::find(candidate.private_points.begin(), candidate.private_points.end(), *handle) !=
         candidate.private_points.end();
     candidate.move_state = consume_source && !keep_source && checkpoints[handle->index].pins == 0 &&
-                           state_references == 1 && state_store->source_pins(record.state) == 0;
+                           state_references == 1 && state_store->source_pins(record.state) == 0 &&
+                           !state_store->cold_busy(record.state);
     candidate.split_state =
         !candidate.move_state && occupied_states == state_store->device_capacity() &&
         state_store->device_resident(record.state) && state_store->host_resident(record.state) &&
-        state_store->source_pins(record.state) == 0;
+        state_store->source_pins(record.state) == 0 && !state_store->cold_busy(record.state);
     if (!candidate.move_state && !candidate.split_state &&
         occupied_states == state_store->device_capacity() &&
         state_store->device_resident(record.state) && state_store->source_pins(record.state) == 0 &&
@@ -147,6 +152,10 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             }
         }
     }
+    if (state_store->cold_only(record.state)) {
+        candidate.transfers.push_back(state_transfer_requirement(
+            state_images->host_layout(), runtime::ContextTransferDirection::ColdToHost));
+    }
     if (!state_store->device_resident(record.state)) {
         candidate.transfers.push_back(state_transfer_requirement(
             state_images->host_layout(), runtime::ContextTransferDirection::HostToDevice));
@@ -160,8 +169,13 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
                           runtime::ContextResourceClass resource) {
         const auto count      = kv_pages_for_frontier(frontier);
         const auto& physical  = pages.physical_pool();
-        std::uint32_t missing = 0, run_pages = 0;
-        TransferWork restore_work;
+        std::uint32_t missing = 0, run_pages = 0, cold_pages = 0;
+        TransferWork restore_work, cold_work;
+        const auto cold_stride =
+            cold_store ? cold_store->object_bytes(resource == runtime::ContextResourceClass::MainKV
+                                                      ? ColdObjectClass::MainKVPage
+                                                      : ColdObjectClass::BackendKVPage)
+                       : 0;
         const auto finish_run = [&] {
             const auto work = physical.host_transfer_run_work(run_pages);
             restore_work.payload_bytes += work.payload_bytes;
@@ -169,9 +183,24 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             run_pages = 0;
         };
         std::optional<HostKVPageReplica> previous;
+        bool previous_cold = false;
         for (std::uint32_t index = 0; index < count; ++index) {
             const auto page = addresses.logical_page(address, index);
             if (pages.device_resident(page)) { continue; }
+            if (pages.cold_only(page)) {
+                // A restore publishes cold pages in contiguous Host extents: priced as one run.
+                if (!previous_cold && run_pages) { finish_run(); }
+                previous.reset();
+                previous_cold = true;
+                cold_work.payload_bytes += cold_stride;
+                ++cold_work.copy_operations;
+                ++cold_pages;
+                ++run_pages;
+                ++missing;
+                continue;
+            }
+            if (previous_cold) { finish_run(); }
+            previous_cold      = false;
             const auto replica = pages.host_replica(page);
             if (previous && (previous->extent != replica.extent ||
                              previous->page_offset + 1 != replica.page_offset)) {
@@ -180,6 +209,10 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             previous = replica;
             ++run_pages;
             ++missing;
+        }
+        if (cold_pages) {
+            candidate.transfers.push_back(kv_transfer_requirement(
+                resource, runtime::ContextTransferDirection::ColdToHost, cold_pages, cold_work));
         }
         if (missing) {
             finish_run();

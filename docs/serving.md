@@ -907,6 +907,10 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations | `8192 MiB + 8 native StateImages` |
+| `--ssd-context-dir PATH` | process-volatile SSD tier below Host context; requires prefix reuse and nonzero Host context | off |
+| `--ssd-context-gib N` | upper bound for the SSD tier segment files; requires `--ssd-context-dir` | `100` |
+| `--ssd-context-demote-window-seconds N` | age rule: a Host victim idle longer than `N` seconds since its last real demand is erased on demand, oldest first, instead of being written to the SSD; positive; requires `--ssd-context-dir` | `600` |
+| `--ssd-context-watermark-percent N` | pre-write victims inside the window to the SSD (keeping Host) while free Host context is below `N` percent of its capacity; `0` disables, at most `90`; requires `--ssd-context-dir` | `10` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
@@ -938,6 +942,30 @@ Host state and Main/Backend KV share one startup-fixed byte budget; this is cont
 limit on total process RAM. `--host-context-mib 0` disables Host context backing.
 `--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
 available, and the capacity flags may still be specified.
+
+`--ssd-context-dir` adds an SSD tier below Host context. History that Host pressure would otherwise
+erase is first written to the SSD, and a later request restores it SSD → Host → Device before
+binding. A checkpoint moves to the SSD whole: its Host copies are released only after every
+covered StateImage and KV page, partial tail page included, has an SSD copy. Under Device pressure,
+demoting history to Host (and from there to the SSD) ranks ahead of erasing it.
+History idle longer than the demote window is not written: it is erased when space is needed,
+oldest first. A pressure write batch is bounded to 2 GiB and a pre-write batch to 256 MiB; further victims
+wait in Host for the next batch. When the SSD is full, the SSD checkpoint with the oldest real demand is evicted (its SSD
+copies are released, or a cold-only checkpoint is erased; nothing is written), except that a
+victim older than every evictable SSD checkpoint is erased instead. Checkpoints that a request
+waits for or that are being restored are never evicted. Below the Host free watermark, victims
+inside the window are pre-written so that a later pressure demotion only releases Host; Host
+reclaim waits for an in-flight pre-write batch. Write volume is not throttled; watch
+`ninfer_ssd_context_written_bytes_24h`. Contents never survive the process: startup takes an
+exclusive lock on the directory,
+deletes its `seg_*.bin` files, and refuses RAM-backed (tmpfs/ramfs) directories, directories
+without `O_DIRECT`, file systems with less free space than `--ssd-context-gib` plus 1 GiB, and
+devices slower than 500 MB/s in a 512 MiB startup write/read probe (a consumer NVMe can measure close
+to that floor; check the probe result before relying on the tier). The default 100 GiB capacity needs
+that much free space on the file system; pass a smaller `--ssd-context-gib` otherwise. The probe's read rate prices
+SSD restores in source selection. Repeated I/O failures or an I/O exceeding 30 s disable the tier
+for the rest of the process; a copy that fails its checksum is discarded and the request falls
+back to another source or prefill. Startup writes are counted in the SSD write totals.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 
@@ -975,6 +1003,16 @@ curl http://127.0.0.1:8080/metrics
 | `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; retained history also occupies these pools |
 | `ninfer_host_context_{used,reserved,capacity,peak}_bytes` | Unified Host backing; reserved bytes are already included in used bytes |
 | `ninfer_context_transfer_bytes_total{resource,direction}` | Actual State/Main KV/backend KV payload transfers |
+| `ninfer_context_reclaim_erased_checkpoints_total` | Checkpoints erased by Device or Host reclaim instead of demoted |
+| `ninfer_context_reclaim_device_erased_checkpoints_total` | Subset erased by Device-pressure release actions; with the SSD tier these are the fallback when no demotion ranked first or could start |
+| `ninfer_context_reclaim_spilled_demotions_total` | Device-pressure demotions whose Host victims the SSD tier took whole instead of erasing them |
+| `ninfer_ssd_context_{capacity,segment,used}_bytes`, `ninfer_ssd_context_cold_only_{kv_pages,states}`, `ninfer_ssd_context_disabled` | SSD tier files, occupied slots, Main KV pages/StateImages whose only replica is on the SSD, and the disabled state; present only with `--ssd-context-dir` |
+| `ninfer_ssd_context_written_bytes_total`, `ninfer_ssd_context_written_bytes_24h`, `ninfer_ssd_context_read_bytes_total` | Bytes issued to the SSD, including partial failed or cancelled writes. The cumulative totals and the 24 h gauge (a trailing per-minute window) both include the startup probe; a Prometheus rate over the counters excludes it |
+| `ninfer_ssd_context_{spills,restores,restore_failures,checksum_failures,erased_checkpoints}_total` | Completed Host-pressure spills and SSD restores, failed restores and checksum mismatches, and Host-pressure victims erased without an SSD copy while the tier is configured |
+| `ninfer_ssd_context_demote_window_seconds`, `ninfer_ssd_context_prewrite_watermark_percent` | Configured age rule window and pre-write watermark |
+| `ninfer_ssd_context_expired_erasures_total` | Host-pressure victims erased by the age rule (a subset of `erased_checkpoints`) |
+| `ninfer_ssd_context_{evictions,evicted_bytes}_total` | Checkpoints evicted from a full SSD tier for newer victims, and the SSD copy bytes they held |
+| `ninfer_ssd_context_{prewrites,prewrite_wasted}_total` | Checkpoints pre-written below the watermark, and those erased or evicted before a demotion used the copy |
 | `ninfer_host_work_seconds_total{phase}`, `ninfer_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
 | `ninfer_constraint_requests_total{outcome}`, `ninfer_constraint_cache_total{result}` | Settled constrained requests by completion state and compilation-cache access |
 | `ninfer_constraint_{prepare,mask,matcher}_seconds_total`, `ninfer_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results |
@@ -1004,7 +1042,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v25 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v26 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -1039,12 +1077,17 @@ as full-precision JSON numbers. Its `speculative` object contains `backend`, `dr
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 `generation.scheduling` records preemptions, snapshot/replay restores, replayed tokens, paused time
 and request-owned transfer bytes. Replay rebuilds committed state without adding new output usage.
+`cold_restores`, `cold_to_host_bytes` and `cold_restore_wait_ns` count the SSD-to-Host restores this
+request waited for before binding, their object bytes, and the wait from joining each restore to its
+completion; the wait is also part of `source_wait_seconds`.
 
 `generation.admission` records the initial `preferred_reused_tokens`, `source_wait_seconds`,
 `revoked_checkpoints`, and `fallback_reason`. Source waiting is a subset of initial queue time;
 selecting or retaining a checkpoint does not itself count as a cache hit. Revocations count retained
 checkpoint references removed under resource pressure. Fallback reasons are `none`, `source_invalid`,
-`source_revoked`, `cost_changed`, `capacity_limit`, and `isolated_capacity`.
+`source_revoked`, `cost_changed`, `capacity_limit`, `isolated_capacity`, `cold_unavailable`
+(SSD-only content could not be read back: tier disabled, I/O failure, or no complete Host
+destination), and `cold_checksum` (the SSD copy failed its checksum and was discarded).
 
 `request_scheduling` records `pause_started`, `paused`, `restore_started`, `restored`,
 `replay_complete`, `recovery_complete`, `snapshot_revoked`, and a `terminal` boundary for preempted
@@ -1114,9 +1157,18 @@ same interval. The
 `running`, `prefilling`, `decode_ready`, `waiting`, `paused`, `replaying`, `materializing`,
 `capture_pending`, and `terminal_pending` fields are the Engine scheduler snapshot at the end of the
 interval. The JSONL `context_cache` object reports selections, captures, StateImage operations,
-transfers, tail-page COW and pressure spills as interval deltas; `occupancy` and `last_selection` are
+transfers, tail-page COW, pressure spills, reclaim-erased checkpoints with their Device-pressure
+share (`pressure.device_erased_checkpoints`) and `pressure.spilled_demotions` as interval deltas; `occupancy` and `last_selection` are
 end-of-interval gauges. The separate `scheduling` object reports preemptions, restores and replayed
-tokens. Occupancy includes Host reservations while transfers are in flight.
+tokens. Occupancy includes Host reservations while transfers are in flight. With
+`--ssd-context-dir`, `context_cache.cold` adds SSD tier gauges (`capacity_bytes`, `segments`, `segment_bytes`,
+`occupied_bytes`, object and cold-only counts, in-flight bytes, `jobs`, `write_bytes_total`,
+`write_bytes_24h`, both including the startup probe, probe rates, `disabled`) and interval deltas (`write_bytes`, `read_bytes`,
+failures, spill and restore counts, `spill_host_bytes_released`, `erased_checkpoints`,
+`expired_erasures`, `evictions`, `evicted_bytes`, `prewrites`, `prewrite_wasted`,
+`lost_checkpoints`, `restore_bytes`, `restore_seconds`). `server_start.engine.context_cache` records
+`ssd_directory`, `ssd_capacity_bytes`, `ssd_demote_window_seconds` and
+`ssd_prewrite_watermark_percent`.
 
 The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
 wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five
