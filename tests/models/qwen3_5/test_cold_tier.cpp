@@ -518,6 +518,36 @@ public:
         expect_empty("partial batch demotion leaked resources");
     }
 
+    // A StateImage another checkpoint also holds stays in Host when one holder is demoted.
+    void shared_state_stays_for_other_holders() {
+        const auto source = checkpoint(tokens(128));
+        const std::array set{source};
+        demote_all(set);
+        std::optional<qwen::detail::StateImageHandle> image;
+        program_.visit_checkpoint_objects(
+            program_.checkpoint(source),
+            [&](qwen::detail::StateImageHandle state) { image = state; },
+            [](qwen::detail::LogicalKVPageStore&, qwen::detail::LogicalKVPageHandle,
+               runtime::ContextResourceClass) {});
+        require(image.has_value(), "checkpoint has no StateImage");
+        // A second checkpoint's reference to the same image, as a shared capture point holds.
+        program_.state_store->retain_checkpoint_reference(*image);
+        require(program_.start_spill(set).status == qwen::ColdStartStatus::Started,
+                "spill did not start");
+        (void)wait_one();
+        (void)program_.release_cold_host(set);
+        require(program_.state_store->host_resident(*image),
+                "a StateImage another checkpoint holds left Host");
+        require(program_.state_store->release_checkpoint_owner(*image),
+                "the extra reference was not releasable");
+        (void)program_.release_cold_host(set);
+        require(!program_.state_store->host_resident(*image),
+                "the sole holder's StateImage stayed in Host");
+        (void)program_.drop_cold(set);
+        require(program_.release_checkpoint(source), "checkpoint was not releasable");
+        expect_empty("shared state demotion leaked resources");
+    }
+
     // Spill in flight while the checkpoint is released: Host survives until the write retires.
     void release_during_spill() {
         const auto source = checkpoint(tokens(192));
@@ -721,6 +751,7 @@ int main(int argc, char** argv) {
             fixture.shared_pages();
             fixture.shared_page_stays_for_other_holders();
             fixture.shared_page_waits_for_every_holder();
+            fixture.shared_state_stays_for_other_holders();
             fixture.release_during_spill();
             fixture.checksum_failure();
             fixture.cancel_restore();

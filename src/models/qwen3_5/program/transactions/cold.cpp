@@ -51,6 +51,11 @@ std::uint64_t shared_page_key(const LogicalKVPageStore& store, LogicalKVPageHand
            store.descriptor_index(page);
 }
 
+// Identifies one StateImage in the same key space as shared_page_key (bit 33 marks a state).
+std::uint64_t shared_state_key(const StateImageStore& store, StateImageHandle state) {
+    return (1ULL << 33U) | store.descriptor_index(state);
+}
+
 } // namespace
 
 ProgramImpl::ColdResidency ProgramImpl::cold_residency(CheckpointHandle handle) const {
@@ -120,7 +125,11 @@ ProgramImpl::victim_page_holders(std::span<const CheckpointHandle> handles) cons
         if (!valid_checkpoint(handle)) { continue; }
         ObjectSet once;
         visit_checkpoint_objects(
-            checkpoint(handle), [&](StateImageHandle) {},
+            checkpoint(handle),
+            [&](StateImageHandle state) {
+                if (!once.insert_state(*state_store, state)) { return; }
+                ++holders[shared_state_key(*state_store, state)];
+            },
             [&](const LogicalKVPageStore& pages, LogicalKVPageHandle page,
                 runtime::ContextResourceClass resource) {
                 if (!once.insert_page(pages, page, resource)) { return; }
@@ -191,6 +200,9 @@ ColdQuote ProgramImpl::cold_quote(std::span<const CheckpointHandle> handles) con
                     } else if (!state_store->host_releasable_after_spill(state)) {
                         note(state_store->cold_busy(state) ? ColdDemotionBlock::Busy
                                                            : ColdDemotionBlock::Unreleasable);
+                    } else if (state_store->checkpoint_references(state) >
+                               victim_holders[shared_state_key(*state_store, state)]) {
+                        // Another checkpoint holds this image: it stays in Host with its copy.
                     } else if (first) {
                         releasable += image;
                         if (!state_store->device_resident(state)) { ++new_cold_states; }
@@ -662,7 +674,8 @@ std::size_t ProgramImpl::release_cold_host(std::span<const CheckpointHandle> han
                 if (!state_store->cold_replica_current(image) ||
                     !state_store->can_drop_host_to_cold(image)) {
                     plan.whole = false;
-                } else {
+                } else if (state_store->checkpoint_references(image) <=
+                           holders[shared_state_key(*state_store, image)]) {
                     plan.state = image;
                 }
             },
@@ -699,11 +712,16 @@ std::size_t ProgramImpl::release_cold_host(std::span<const CheckpointHandle> han
         plans.clear();
         std::vector<CheckpointHandle> next;
         ObjectSet counted;
-        std::uint32_t new_main = 0, new_backend = 0;
+        std::uint32_t new_states = 0, new_main = 0, new_backend = 0;
         for (const auto handle : eligible) {
             auto plan = plan_of(handle, holders);
             std::uint32_t added_main = 0, added_backend = 0;
+            std::uint32_t added_states = 0;
             if (plan.whole) {
+                if (plan.state && !state_store->device_resident(*plan.state) &&
+                    counted.insert_state(*state_store, *plan.state)) {
+                    added_states = 1;
+                }
                 for (const auto& ref : plan.pages) {
                     if (ref.store->device_resident(ref.page) ||
                         !counted.insert_page(*ref.store, ref.page, ref.resource)) {
@@ -716,10 +734,13 @@ std::size_t ProgramImpl::release_cold_host(std::span<const CheckpointHandle> han
                     return added == 0 || (pages && total + added <= pages->cold_only_limit() -
                                                                         pages->cold_only_pages());
                 };
-                plan.whole = fits(new_main, added_main, text_kv_pages.get()) &&
+                plan.whole = new_states + added_states <=
+                                 state_store->cold_only_limit() - state_store->cold_only_states() &&
+                             fits(new_main, added_main, text_kv_pages.get()) &&
                              fits(new_backend, added_backend, backend_kv_pages.get());
             }
             if (plan.whole) {
+                new_states += added_states;
                 new_main += added_main;
                 new_backend += added_backend;
                 next.push_back(handle);
@@ -738,7 +759,8 @@ std::size_t ProgramImpl::release_cold_host(std::span<const CheckpointHandle> han
         if (!plan.releases.empty() && !host_kv_extents->release_page_replicas(plan.releases)) {
             throw std::logic_error("cold Host release changed after its check");
         }
-        if (plan.state && !state_store->drop_host_to_cold(*plan.state)) {
+        if (plan.state && state_store->host_resident(*plan.state) &&
+            !state_store->drop_host_to_cold(*plan.state)) {
             throw std::logic_error("cold StateImage release changed after its check");
         }
     }
