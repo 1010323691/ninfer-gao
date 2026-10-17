@@ -73,6 +73,8 @@ enum class ContextTransferDirection : std::uint8_t {
     DeviceToHost,
     HostToDevice,
     DeviceToDevice,
+    // SSD tier read into Host (cold restore before binding). Never part of a GPU transaction.
+    ColdToHost,
 };
 
 struct ContextTransferObservation {

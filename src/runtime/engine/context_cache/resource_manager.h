@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -26,6 +28,7 @@ public:
     using Source     = typename Model::SourceCandidate;
     using SessionKey = typename Model::CacheSessionKey;
     using OwnerToken = ContinuationOwnerToken;
+    using WallClock  = std::chrono::steady_clock;
 
     using DemandKey =
         typename decltype(std::declval<const Base&>().prefix_shortlist_key(0))::value_type;
@@ -76,8 +79,108 @@ public:
         std::uint64_t ordinal           = 0;
     };
 
+    // What the policy did with a batch: `erase` lists the victims no lower tier takes (erased as
+    // without a tier); the others were demoted whole. `pending` means an SSD write started and
+    // their Host bytes are released when it completes.
+    struct HostVictimDisposal {
+        bool pending = false;
+        std::vector<Handle> erase;
+    };
+
+    // Strategy hook for victims that Host reclaim selected in its existing order. Without a
+    // policy they are erased. `erased` is the read-only quote of the victims `dispose` would erase
+    // now; reclaim ranks a demotion's Host victims by that loss alone. `pending` reports a
+    // disposed batch that still holds its Host bytes; Host reclaim then waits instead of
+    // selecting more victims.
+    // `demote_window` is the age rule: a victim whose last real demand is older is erased on
+    // demand instead of demoted, and Host reclaim takes such victims first, oldest first.
+    struct HostVictimPolicy {
+        std::function<HostVictimDisposal(Program&, std::span<const Handle>)> dispose;
+        std::function<std::vector<Handle>(Program&, std::span<const Handle>)> erased;
+        std::function<bool()> pending;
+        std::optional<std::chrono::nanoseconds> demote_window;
+    };
+
     explicit ResourceManager(bool enabled, ContextMachineCostModel costs)
         : enabled_(enabled), costs_(std::move(costs)) {}
+
+    void set_host_victim_policy(HostVictimPolicy policy) {
+        host_victim_policy_ = std::move(policy);
+    }
+
+    // Wall clock of real demand (`touched`); replaceable for tests. It never orders retention:
+    // the logical clock does.
+    void set_wall_clock(std::function<WallClock::time_point()> clock) {
+        wall_clock_ = std::move(clock);
+    }
+
+    // Time since the latest real demand (adoption, reuse, publication, finish) of any catalog
+    // record holding the checkpoint. A waiting or Engine-held checkpoint is in use: zero.
+    [[nodiscard]] std::chrono::nanoseconds idle_for(Handle handle) const {
+        if (pinned(handle)) { return std::chrono::nanoseconds{0}; }
+        std::optional<WallClock::time_point> latest;
+        const auto include = [&](WallClock::time_point touched) {
+            if (!latest || touched > *latest) { latest = touched; }
+        };
+        for (const auto& owner : owners_) {
+            if (std::any_of(owner.points.begin(), owner.points.end(),
+                            [&](const auto& point) { return point.handle == handle; })) {
+                include(owner.touched);
+            }
+        }
+        for (const auto& shared : shared_) {
+            if (shared.handle == handle) { include(shared.touched); }
+        }
+        if (!latest) { return std::chrono::nanoseconds{0}; }
+        const auto now = wall_now();
+        return now > *latest ? std::chrono::duration_cast<std::chrono::nanoseconds>(now - *latest)
+                             : std::chrono::nanoseconds{0};
+    }
+
+    // Whether the installed policy's age rule erases this victim instead of demoting it.
+    [[nodiscard]] bool expired(Handle handle) const {
+        return host_victim_policy_.demote_window &&
+               idle_for(handle) > *host_victim_policy_.demote_window;
+    }
+
+    // A waiting admission or an Engine hold uses the checkpoint; it is never evicted.
+    [[nodiscard]] bool pinned(Handle handle) const {
+        if (std::find(holds_.begin(), holds_.end(), handle) != holds_.end()) { return true; }
+        return std::any_of(waiting_.begin(), waiting_.end(),
+                           [&](const auto& waiting) { return contains(waiting.held, handle); });
+    }
+
+    // Catalog checkpoints in reclaim order (oldest, least protected first).
+    [[nodiscard]] std::vector<Handle> victim_order() const { return victims(); }
+
+    // Checkpoints erased by reclaim (Device or Host pressure), whatever lower tier exists.
+    [[nodiscard]] std::uint64_t reclaim_erasures() const noexcept { return reclaim_erasures_; }
+
+    // Checkpoints erased by a Device-pressure release action: the fallback when no demotion
+    // ranked first or could start.
+    [[nodiscard]] std::uint64_t device_release_erasures() const noexcept {
+        return device_release_erasures_;
+    }
+
+    // Device-pressure demotions whose Host victims the policy took (at least one demoted to the
+    // lower tier instead of erased).
+    [[nodiscard]] std::uint64_t spilled_demotions() const noexcept { return spilled_demotions_; }
+
+    [[nodiscard]] bool host_victims_pending() const {
+        return host_victim_policy_.pending && host_victim_policy_.pending();
+    }
+
+    // An Engine-owned reference that keeps a checkpoint alive while Native work outside a
+    // request (an SSD restore) uses it. It is neither a victim nor consumable, and releasing the
+    // last reference of any kind releases the checkpoint as usual.
+    void hold(Handle handle) { holds_.push_back(handle); }
+
+    void release_hold(Program& program, Handle handle) {
+        const auto found = std::find(holds_.begin(), holds_.end(), handle);
+        if (found == holds_.end()) { return; }
+        holds_.erase(found);
+        release_unreferenced(program, handle);
+    }
 
     [[nodiscard]] std::vector<SourceChoice>
     candidates(Program& program, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
@@ -303,6 +406,7 @@ public:
                                     CacheRetentionPriority{.reused = true, .last_demand = used_at});
                 }
                 if (auto* owner = find_owner(choice.owner)) {
+                    owner->touched  = wall_now();
                     priority        = {.reused = true, .last_demand = used_at};
                     proven_frontier = choice.source.reused_tokens;
                     // Consuming a branch replaces its proof. A shallower independent
@@ -314,6 +418,7 @@ public:
                     if (choice.take_over) { token = owner->token; }
                 } else if (auto* shared = find_shared(choice.shared_entry)) {
                     shared->priority = {.reused = true, .last_demand = used_at};
+                    shared->touched  = wall_now();
                 }
             }
             if (!token) {
@@ -327,6 +432,7 @@ public:
         auto* owner              = find_owner(token);
         owner->active            = true;
         owner->publication_order = publication_order;
+        owner->touched           = wall_now();
         replace_points(program, *owner, carried);
         prune(program);
         balance_reused(program);
@@ -347,7 +453,8 @@ public:
                     {.handle   = handle,
                      .ordinal  = ++ordinal_,
                      .priority = demand_priority(program.checkpoint_key(handle, summary.frontier)),
-                     .retained_at = ++clock_});
+                     .retained_at = ++clock_,
+                     .touched     = wall_now()});
                 index_.insert(program, handle, summary.frontier);
             }
         } else {
@@ -355,6 +462,7 @@ public:
             if (!owner) {
                 throw std::logic_error("checkpoint publication lost continuation owner");
             }
+            owner->touched      = wall_now();
             const auto observed = demand_priority(program.checkpoint_key(handle, summary.frontier));
             if (summary.role == CheckpointRole::InputReplay && observed.reused &&
                 (!owner->priority.reused || observed.last_demand > owner->priority.last_demand)) {
@@ -397,6 +505,7 @@ public:
         if (!owner) { return; }
         owner->active            = false;
         owner->publication_order = publication_order;
+        owner->touched           = wall_now();
         const auto& advice       = base.context_cache();
         if (advice.update_session_index && advice.session_key) {
             const auto newer = std::any_of(owners_.begin(), owners_.end(), [&](const auto& other) {
@@ -506,9 +615,10 @@ public:
                                      cursor, evaluation);
     }
 
-    void commit_host_victims(Program& program, std::span<const Handle> handles,
-                             ReclaimCursor& cursor) {
-        commit_release(program, handles, cursor);
+    [[nodiscard]] ReclaimProgress commit_host_victims(Program& program,
+                                                     std::span<const Handle> handles,
+                                                     ReclaimCursor& cursor) {
+        return commit_host_release(program, handles, cursor);
     }
 
     bool erase(Program& program, Handle handle, ReclaimRights rights = {}) {
@@ -544,13 +654,15 @@ public:
             }
         }
         if (shortage.host_bytes) {
+            // One disposed batch at a time: its Host bytes are not yet free, so selecting again
+            // would take further victims for the same shortage.
+            if (host_victims_pending()) { return ReclaimProgress::Spilling; }
             Evaluation evaluation;
             const auto victims =
                 host_victims_in_order(program, shortage.host_bytes, std::nullopt, {}, excluded,
                                       cursor.admission, cursor, evaluation, true);
-            if (!victims) { return ReclaimProgress::Blocked; }
-            commit_release(program, *victims, cursor);
-            return victims->empty() ? ReclaimProgress::Blocked : ReclaimProgress::Changed;
+            if (!victims || victims->empty()) { return ReclaimProgress::Blocked; }
+            return commit_host_release(program, *victims, cursor);
         }
         auto plans = program.plan_reclaim(allowed, excluded, shortage);
         Evaluation evaluation{.native = &plans};
@@ -563,6 +675,8 @@ public:
             std::vector<Handle> host_victims;
             std::optional<Admission> preservation;
             ActionRank rank;
+            // Recovery loss if every Host victim were erased; charged only when they are.
+            std::uint64_t host_loss = 0;
         };
 
         const auto usage     = program.physical_usage();
@@ -602,6 +716,18 @@ public:
             auto host_facts = action_facts(program, *victims, cursor, evaluation);
             const auto host_rank = rank_action(program, *victims, host_facts, units, evaluation);
             rank.loss            = host_rank.loss;
+            if (host_victim_policy_.erased && !victims->empty()) {
+                // A victim the lower tier takes whole stays recoverable: only the victims the
+                // policy would still erase count as this demotion's loss.
+                const auto erased = host_victim_policy_.erased(program, *victims);
+                if (erased.empty()) {
+                    rank.loss = 0;
+                } else if (erased.size() != victims->size()) {
+                    auto erased_facts = action_facts(program, erased, cursor, evaluation);
+                    rank.loss =
+                        rank_action(program, erased, erased_facts, units, evaluation).loss;
+                }
+            }
             rank.waiting         = host_rank.waiting;
             rank.order           = std::max(rank.order, host_rank.order);
             if (host_rank.priority.reused &&
@@ -612,7 +738,8 @@ public:
             actions.push_back({.demotion     = std::move(plan),
                                .host_victims = std::move(*victims),
                                .preservation = std::move(preservation),
-                               .rank         = rank});
+                               .rank         = rank,
+                               .host_loss    = host_rank.loss});
         }
         for (auto& plan : plans.releases) {
             const auto units = useful(plan.released, shortage);
@@ -626,8 +753,14 @@ public:
         }
         std::stable_sort(actions.begin(), actions.end(),
                          [](const auto& a, const auto& b) { return less_rank(a.rank, b.rank); });
+        bool waits_for_host = false;
         for (std::size_t index = 0; index < actions.size(); ++index) {
             const auto& action = actions[index];
+            if (action.demotion && !action.host_victims.empty() && host_victims_pending()) {
+                // Its Host destination depends on the batch still being written.
+                waits_for_host = true;
+                continue;
+            }
             if (action.demotion) {
                 if (!shortage.state_slots && action.host_victims.empty()) {
                     // Preserve the ranked action order. Independent KV groups can share
@@ -675,7 +808,9 @@ public:
                     program, plan.host_bytes, action.preservation->checkpoint, {},
                     protected_sources, action.preservation, cursor, evaluation);
                 if (!current || *current != action.host_victims) { continue; }
-                commit_release(program, action.host_victims, cursor, action.rank.loss);
+                const auto host = commit_host_release(program, action.host_victims, cursor,
+                                                      action.host_loss, true);
+                if (host == ReclaimProgress::Spilling) { return host; }
                 if (program.start_demote(plan)) {
                     return program.has_context_transaction() ? ReclaimProgress::Transferring
                                                              : ReclaimProgress::Changed;
@@ -685,9 +820,10 @@ public:
             }
             // Native quoted every holder required for this actual physical release.
             commit_release(program, action.release->sources, cursor, action.rank.loss);
+            device_release_erasures_ += action.release->sources.size();
             return ReclaimProgress::Changed;
         }
-        return ReclaimProgress::Blocked;
+        return waits_for_host ? ReclaimProgress::Spilling : ReclaimProgress::Blocked;
     }
 
     void release_all(Program& program) noexcept {
@@ -697,6 +833,7 @@ public:
         shared_.clear();
         waiting_.clear();
         demand_.clear();
+        holds_.clear();
         for (const auto handle : handles) {
             if (program.valid_checkpoint(handle)) { (void)program.release_checkpoint(handle); }
         }
@@ -730,7 +867,9 @@ private:
             allowed = std::count_if(entry->points.begin(), entry->points.end(),
                                     [&](const auto& point) { return point.handle == handle; });
         }
-        if (catalog_reference_count(handle) != allowed) { return false; }
+        if (catalog_reference_count(handle) != allowed || contains(holds_, handle)) {
+            return false;
+        }
         for (const auto& waiting : waiting_) {
             if (!contains(waiting.held, handle)) { continue; }
             if (waiting.binding) { return false; }
@@ -822,6 +961,7 @@ private:
         bool active                     = false;
         std::optional<SessionKey> session;
         std::vector<Point> points;
+        WallClock::time_point touched{};
     };
 
     struct Shared {
@@ -829,7 +969,12 @@ private:
         std::uint64_t ordinal;
         CacheRetentionPriority priority;
         std::uint64_t retained_at;
+        WallClock::time_point touched{};
     };
+
+    [[nodiscard]] WallClock::time_point wall_now() const {
+        return wall_clock_ ? wall_clock_() : WallClock::now();
+    }
 
     static bool contains(std::span<const Handle> handles, Handle handle) {
         return std::find(handles.begin(), handles.end(), handle) != handles.end();
@@ -867,6 +1012,7 @@ private:
     std::size_t reference_count(Handle handle) const {
         auto count = catalog_reference_count(handle);
         for (const auto& waiting : waiting_) { count += contains(waiting.held, handle); }
+        count += static_cast<std::size_t>(std::count(holds_.begin(), holds_.end(), handle));
         return count;
     }
 
@@ -932,6 +1078,7 @@ private:
             for (const auto handle : waiting.held) { inspect(handle); }
         }
         for (const auto handle : stale) { forget(handle); }
+        std::erase_if(holds_, [&](Handle handle) { return !program.valid_checkpoint(handle); });
         std::erase_if(owners_,
                       [](const auto& owner) { return !owner.active && owner.points.empty(); });
     }
@@ -1285,8 +1432,32 @@ private:
                 throw std::logic_error("quoted cache release changed before commit");
             }
         }
+        reclaim_erasures_ += handles.size();
         cursor.sacrificed =
             loss > UINT64_MAX - cursor.sacrificed ? UINT64_MAX : cursor.sacrificed + loss;
+    }
+
+    // Host victims go to the policy first; only victims it does not take are erased. A quoted
+    // loss covers the complete batch and is reused only when the whole batch is erased.
+    [[nodiscard]] ReclaimProgress
+    commit_host_release(Program& program, std::span<const Handle> handles, ReclaimCursor& cursor,
+                        std::optional<std::uint64_t> quoted_loss = std::nullopt,
+                        bool demotion = false) {
+        if (handles.empty()) { return ReclaimProgress::Changed; }
+        // Every Host-victim path waits for a disposed batch instead of erasing past it.
+        if (host_victims_pending()) { return ReclaimProgress::Spilling; }
+        if (!host_victim_policy_.dispose) {
+            commit_release(program, handles, cursor, quoted_loss);
+            return ReclaimProgress::Changed;
+        }
+        const auto disposal = host_victim_policy_.dispose(program, handles);
+        if (disposal.erase.size() == handles.size()) {
+            commit_release(program, handles, cursor, quoted_loss);
+        } else {
+            commit_release(program, disposal.erase, cursor);
+            if (demotion) { ++spilled_demotions_; }
+        }
+        return disposal.pending ? ReclaimProgress::Spilling : ReclaimProgress::Changed;
     }
 
     [[nodiscard]] std::optional<std::vector<Handle>>
@@ -1325,12 +1496,23 @@ private:
         auto actions = program.plan_releases(allowed, excluded, {.host_bytes = required});
         std::vector<Handle> selected;
         std::size_t released = 0;
+        // Age rule of an installed policy: actions whose holders are all past the demote window
+        // go first, oldest (by their freshest holder) first; others keep the ordinary ranking.
+        const auto age =
+            [&](std::span<const Handle> sources) -> std::optional<std::chrono::nanoseconds> {
+            if (!host_victim_policy_.demote_window || sources.empty()) { return std::nullopt; }
+            auto freshest = idle_for(sources.front());
+            for (const auto handle : sources) { freshest = std::min(freshest, idle_for(handle)); }
+            if (freshest <= *host_victim_policy_.demote_window) { return std::nullopt; }
+            return freshest;
+        };
         while (released < required) {
             std::optional<std::size_t> best;
             std::vector<Handle> best_union;
             std::size_t best_bytes = 0;
             ActionRank best_rank;
             std::size_t best_snapshot_order = 0;
+            std::optional<std::chrono::nanoseconds> best_age;
             for (std::size_t i = 0; i < actions.size(); ++i) {
                 auto combined = selected;
                 for (const auto handle : actions[i].sources) {
@@ -1354,15 +1536,22 @@ private:
                         snapshot_order = snapshot + 1;
                     }
                 }
+                const auto action_age = age(actions[i].sources);
+                const auto older      = [&] {
+                    if (bool(action_age) != bool(best_age)) { return bool(action_age); }
+                    if (action_age && *action_age != *best_age) { return *action_age > *best_age; }
+                    return less_rank(rank, best_rank);
+                };
                 // Ordinary history is exhausted before Engine-owned paused snapshots.
                 // Snapshot candidates retain the Engine's explicit youngest-first order.
                 if (!best || snapshot_order < best_snapshot_order ||
-                    (snapshot_order == best_snapshot_order && less_rank(rank, best_rank))) {
+                    (snapshot_order == best_snapshot_order && older())) {
                     best                = i;
                     best_union          = std::move(combined);
                     best_bytes          = amount;
                     best_rank           = rank;
                     best_snapshot_order = snapshot_order;
+                    best_age            = action_age;
                 }
             }
             if (!best) { return std::nullopt; }
@@ -1449,10 +1638,16 @@ private:
 
     bool enabled_;
     ContextMachineCostModel costs_;
+    HostVictimPolicy host_victim_policy_;
+    std::function<WallClock::time_point()> wall_clock_;
+    std::uint64_t reclaim_erasures_        = 0;
+    std::uint64_t device_release_erasures_ = 0;
+    std::uint64_t spilled_demotions_       = 0;
     PrefixIndex<Model> index_;
     std::vector<Owner> owners_;
     std::vector<Shared> shared_;
     std::vector<WaitingSource> waiting_;
+    std::vector<Handle> holds_;
     static constexpr std::size_t kDemandCapacity = 256;
     std::vector<Demand> demand_;
     std::uint64_t clock_   = 0;

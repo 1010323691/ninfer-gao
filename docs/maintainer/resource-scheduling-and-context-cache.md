@@ -69,6 +69,8 @@ Main KV 页为 64 token；每种 KV 的物理字节数由其层数、几何和�
 | `max_concurrency` | 同时占用执行绑定的上限 C，范围 1–8 |
 | `context_cache.device_state_slots` | C 个基本 Device StateImage 之外的额外槽数，缺省为 C |
 | `context_cache.host_capacity_bytes` | StateImage、Main/backend KV、暂停快照及传输目的共用的 pinned Host 字节容量 |
+| `context_cache.cold_directory` | Host 之下的 SSD 冷层目录；空表示关闭，需要 context history 与非零 Host 容量 |
+| `context_cache.cold_capacity_bytes` | SSD 段文件总量上限，缺省 100 GiB |
 
 Main KV 容量曲线的页数下界为 `max(ceil(max_context / 64), C)`，上界为
 `C × ceil(max_context / 64)`。下界分别满足单请求独占最大上下文和 C 个最小页的几何要求。Native 同时
@@ -78,6 +80,16 @@ Main KV 容量曲线的页数下界为 `max(ceil(max_context / 64), C)`，上界
 Host 缺省容量为 `8 GiB + 8 × 当前模型 Host StateImage 大小`。它是一个共享 backing，State 与
 KV 的分项占用用于观测，不能再次相加成额外配额。传输目标从预留时就计费，发布只改变其状态，
 不减少占用。Host extent 的分裂、最后引用释放和合并由 allocator 管理。
+
+SSD 冷层是 Host 的冷拷贝层，不是执行平台：GPU 不读 SSD，恢复固定为 SSD → Host → Device。
+它进程内易失：启动时独占锁定目录、删除旧段文件，拒绝 RAM 文件系统、不支持 `O_DIRECT` 的目录、
+剩余空间不足（容量 + 1 GiB）以及启动探测（512 MiB 顺序写读）低于 500 MB/s 的设备；关闭时删除
+段文件。冷层只存三类定长对象（满 Main KV 页、满 backend KV 页、不可变 StateImage），按类分段，
+每段一个文件，段目标 1 GiB 且不超过容量的 1/8；槽分配后只写一次，段全空即 unlink。仅冷对象
+仍占 Native 逻辑描述符，其数量按冷层容量可容纳的对象数在启动时加入描述符上界。写入字节
+（含探测与失败/取消的部分写）同时计入累计值与滚动 24 h 窗口，二者可对账。连续 3 次 I/O 失败或
+单次 I/O 超过 30 s 使冷层在本进程内 `Disabled`，之后所有冷操作不可用；校验失败只作废该副本，
+不计入连续失败。
 
 必要请求输入、token 账本、prepared media、Responses 存储和 Frontend 媒体缓存各有自己的
 生命周期与现有数量、长度或媒体预算约束。Host context 容量不覆盖这些内存，也不限制进程总 RAM。
@@ -247,6 +259,15 @@ Host 内容，将 Device 槽交给新的 active identity；只有 Device 副本�
 不占 lane 或后续执行许可，但会延长已有资源的生命周期。目录被替换后，等待引用仍维持完整性；
 仅由等待者保留的点不作为新的公共目录入口。查询、保留和等待不产生使用热度或缓存命中。
 
+某个覆盖对象只有 SSD 副本的来源仍是合法候选；来源查询在传输项中加入 `ColdToHost` 字节，成本
+系数取自冷层启动探测的读带宽。绑定从不读 SSD：Native 返回需冷恢复后，Engine 先启动该检查点的
+完整 Host 恢复（目的空间一次预留，不流式分段；Host 不足走普通 Host 回收并排除该来源，仍不足则
+放弃该来源，原因 `cold_unavailable`），等待期间保留本次准入决策，同上下文事务一样阻塞后续准入
+直至冷完成。请求的等待引用与 Engine 持有的冷恢复引用共同保护该检查点；Native 恢复作业另 pin
+住检查点和对象。完成后来源变为 Host 来源，重新绑定并走原有 Host→Device 恢复。读失败或校验失败
+作废该副本，失去全部副本的检查点从目录删除，等待者以 `cold_unavailable`/`cold_checksum` 重新
+选择来源；同一检查点的多个等待者共享一个恢复作业，最后一个等待者取消、超时或关闭时取消该作业。
+
 等待保护允许 Device/Host 副本迁移，与实际读取期间的 reader lease 分开。可选缓存写入不能删除
 等待者保有的完整点；fresh 接纳只能撤销较年轻等待者的保护，不能撤销 paused 快照。已接纳请求的
 必要推进和合法恢复，可以在普通回收不足时撤销等待保护。回收先选择能补足实际缺口的完整物理动作，
@@ -306,8 +327,16 @@ Runtime 将候选的恢复损失与保留资格用于各项准入检查和排序
 
 删除损失依据动作后的真实 surviving fallback 计算。嵌套 E、输入点与 Shared 不重复累加同一
 历史的覆盖；同时删除的别名不能充当彼此 fallback。Device→Host 降级在排序前固定所需 Host
-受害者，完整动作的净损失包含这些删除。只有无需删除完整恢复内容时才是零损失，不能仅因
-Device 来源得到保全就优先。提交前复核同一受害集合，变化后重新报价。
+受害者，完整动作的净损失包含其中仍会被删除的受害者：没有冷层时是全部受害者；配置冷层时
+只计 Host 受害者策略报价（§7.4）中不能整体降级到 SSD 的那部分，能整体降级的受害者仍可恢复，
+不计损失。只有无需删除完整恢复内容时才是零损失，不能仅因 Device 来源得到保全就优先。提交前
+复核同一受害集合，变化后重新报价；提交时若策略实际删除了全部受害者，按完整删除损失计入预算。
+
+删除动作以检查点为单位、按需最小：Native 按物理持有者集合给出候选，KV 删除只释放所删检查点
+超出幸存较浅恢复点的后缀，较浅恢复点保留；有用释放量按当前缺口截断，因此同损失比下不会为
+更大释放量多删；每次提交一个动作后重新查询缺口。删除动作在冷层下保留为兜底：降级不能开始、
+排序落后（例如复用内容的需求时间更早）或没有合法降级时才使用，计入
+`reclaim_device_erased_checkpoints`。
 
 只缺几页时，降级选取满足缺口的有限页组，State 和另一 typed pool 不因同属一条历史而全部搬走。
 有完整 Host 副本时直接释放 Device 副本；否则报价并申请 Host 目的。启动动作前重新验证内容和
@@ -345,10 +374,74 @@ Host 与 Device 分步删除共用预算，累计已经牺牲的恢复覆盖；�
 
 降级的 Host 受害集合同时满足迁移源与外层可选捕获的保留权限，并受捕获剩余预算约束。必要执行需要 Device 空间
 不会把自己的权限转授给正在尝试保存的冷缓存。保存没有足够收益或空间时跳过，不阻塞必要执行。
+配置冷层后，降级若需要等待 Host 受害者写入 SSD，必要执行随回收一起等待该批写入（`Spilling`），
+而不是改用删除；这是“逐出即降级”的代价，等待上界是一批压力写入。受害者选择（`host_victims_in_order`）
+的保留资格与预算检查仍按删除损失计算，未按冷层报价放宽。
 
 Host 先释放安全的重复副本，再对有限物理动作作完整预检：实际释放并集足额，且联合持有者都能
 被本次申请替换，才执行删除。Shared 引用的名义大小不重复累加。预检后 allocator 仍须满足
 完整 StateImage 与连续 extent geometry；分配失败可放弃保存，已完成删除不回滚。
+
+### 7.4 Host 受害者与 SSD 冷层
+
+配置冷层时，Host 回收按上述顺序选出的受害者先交给 Engine 的 Host 受害者策略
+（`EngineCore::dispose_host_victims`，可替换的策略点），而不是直接删除。三条 Host 回收路径都经过
+它：Host 缺口回收、Device→Host 降级所需的 Host 受害者、可选捕获的 Host 受害者。
+
+降级以整个检查点为单位、原子：检查点在 Host 上的每个对象（StateImage 与 KV 页，含未满尾页）都有
+当前 SSD 副本后，才一次释放它的全部 Host 副本；否则它的 Host 副本一个都不释放。仍只在 Device 上的
+对象（例如被其他请求持续引用的跨会话共享前缀页，或 Device 压力尚未降级的页）留在 Device，不阻塞、
+也不计入整体降级：恢复只需读回仅在 SSD 的对象，Device 上的部分原样可用。同一检查点的深层后缀先
+冷、浅层前缀后冷，与深端优先一致。`Program::cold_quote`
+回答一组检查点能否整体降级（`whole` 与首个原因 `block`：`Unavailable`、`Lost`、`Busy`、
+`Unspillable`、`Unreleasable`、`Full`），`release_cold_host` 只整体释放。未满尾页在没有 writer 时对
+检查点不可变，按整页大小的冷对象落盘并记录 committed columns；之后若被续写，列数变化使副本失效
+并释放。仍有多个检查点共享的对象被一个检查点降级释放 Host 后，其他共享者对该对象也变为仅冷，
+恢复按对象读回。
+
+策略（`split_host_victims` 同时是只读报价 `HostVictimPolicy::erased`）：
+
+1. 过期受害者（年龄规则，见下）删除；其余逐个报价，能整体降级者（或仅因 SSD 满而不能者）在写批上限内
+   组成一批，再对整批报价一次（共享 SSD 容量）；`Full` 时按下文淘汰，其他原因不能整体降级时全部按删除
+   处理。删除的受害者计入 `cold_erased_checkpoints`。
+2. 对整体降级批 `start_spill`：开始后回收返回 `Spilling`，调用方像等待上下文事务一样等待；写入完成后
+   `release_cold_host` 整体释放，检查点保留在目录中成为仅冷来源；写失败或部分失败时保持 Host 副本，
+   已写成的副本作为冗余副本保留，之后的回收重新决定。
+3. 没有需要写的对象（都已有当前 SSD 副本）时直接整体释放。
+4. 报价与淘汰后 `start_spill` 仍返回 `Full`（文件系统余量）/`Unavailable`，或没有释放任何字节时，该批删除。
+
+Device 压力（§7.2）把这份报价用于排序：降级的 Host 受害者只有策略仍会删除的部分计为损失，因此
+Device-only 检查点优先降级到 Host、再由上述策略落到 SSD，而不是被删除；至少一个受害者被整体降级的
+降级动作计入 `reclaim_spilled_demotions`，删除兜底计入 `reclaim_device_erased_checkpoints`。
+
+#### 年龄规则、SSD 淘汰与预写
+
+- **墙钟活动时间**：`ResourceManager` 的 owner 与 Shared 记录另有 `touched`（`steady_clock`，可注入），
+  在真实需求时刷新：采用（含复用来源的 owner/Shared）、发布、结束。它不参与保留排序（逻辑时钟
+  `last_demand`/`retained_at` 不变）；热点保护降级（`balance_reused`）不是需求，不刷新它。
+  `idle_for(handle)` 取持有该检查点的记录中最近的 `touched`；等待或 Engine hold 的检查点视为在用。
+- **年龄规则**（仅策略已安装时）：空闲超过 `cold_demote_window_seconds`（默认 600 s）的受害者不写
+  SSD，按需擦除；`host_victims_in_order` 先取全部持有者都过期的动作，按其最新持有者的空闲时间
+  从旧到新，其余仍按普通排序。命中恢复后的采用刷新 `touched`，被命中者自然不过期。
+  `split_host_victims` 是 `erased` 报价与 `dispose` 共用的唯一分类。
+- **写批上限**：一批压力写入或预写不超过 2 GiB（第一个受害者总在批内），其余受害者留在 Host，
+  等待下一批。
+- **SSD 满**：整批报价为 `Full` 时不整批删除。Engine 维护自己写过的 SSD 驻留检查点集合（spill 完成时
+  登记、惰性清理），按 `touched` 从最旧开始淘汰：仍有其他副本者 `drop_cold`，仅冷者整体擦除；淘汰
+  不写盘；等待引用与 hold（恢复中）不淘汰。比本批某受害者更新的内容不为它淘汰：比最旧可淘汰内容
+  还旧的受害者直接擦除。以本批报价重新变为 `whole`（`can_allocate`）判断进展；报价模式假定淘汰能腾出
+  空间，只在没有可淘汰内容时报删除。
+- **水位预写**：Host 剩余低于 `cold_prewrite_watermark_percent`（默认 10%）且没有在途批次时，工作循环
+  （每 100 ms 至多一次）按受害者顺序为窗口内、可整体降级且缺 SSD 副本的检查点 `start_spill`，不释放
+  Host；之后的压力降级走 `NothingToDo` → 直接整体释放。在途预写也算 `pending`，Host 回收等待它。
+- **计数**：`cold_expired_erasures`（`cold_erased_checkpoints` 的子集）、`cold_evictions`、
+  `cold_evicted_bytes`、`cold_prewrites`、`cold_prewrite_wasted`（预写后在被降级使用前被擦除或淘汰）。
+  写入量不限流，只用 `cold_write_bytes_24h` 监控。
+
+同一时刻至多一批压力写入；它未完成时 Host 回收不再选择新的受害者。spill 不是 Program 上下文事务。
+深度、写入预算尚未纳入策略（写入只监控）。暂停快照为保存 Snapshot 腾 Host 时不能等待写入，仍直接删除
+受害者，同样计入 `cold_erased_checkpoints`。Device 压力的删除动作不经过这里，计入
+`reclaim_erased_checkpoints` 及其子集 `reclaim_device_erased_checkpoints`。
 
 <a id="scheduling"></a>
 ## 8. 调度、抢占与恢复
@@ -436,6 +529,11 @@ Program 同时至多有一个上下文事务，可执行绑定、捕获、demoti
 提交后等待真实 reader 完成再释放。绑定的不可逆所有权交接另外由采用提交点界定。未完成副本不能成为查询来源。
 Sequence、checkpoint 和 pending handle 的 owner/generation 检查防止迟到完成误用已复用描述。
 设备错误进入 Engine 统一 failure cleanup；普通资源不足返回策略层处理。
+
+SSD 冷层的写入与读回不是上下文事务，由冷层 I/O 线程完成，可与上下文事务并行，也不占 GPU。
+spill 期间对象被 pin，Host 源不得释放或改写；恢复期间目的 Host 空间已预留且不可见，完成并校验后
+一次发布。取消释放恢复的目的预留，SSD 副本不变；写作业取消或失败释放其槽。冷副本的有效性沿用
+Host 副本的内容身份，同一对象共享一份 SSD 副本。Engine 在每个调度周期开头轮询冷完成项。
 
 恢复取得完整目的空间，可能出现最终驻留分布可容纳、交换中间态却不能同时容纳的情况。例如 GPU
 中有 B、Host 中有 A，恢复 A 的完整目的与 B 的 Host 写回目标可能竞争同一余量。没有其他释放者

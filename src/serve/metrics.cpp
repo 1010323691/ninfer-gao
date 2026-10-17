@@ -221,6 +221,53 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
           "StateImages in the shared Host backing.");
     GAUGE(host_kv_occupied_bytes, "host_kv_used_bytes",
           "KV bytes in the shared Host backing, a subset of used bytes.");
+    COUNTER(reclaim_erased_checkpoints, "context_reclaim_erased_checkpoints_total",
+            "Checkpoints erased by Device or Host reclaim instead of being demoted.");
+    COUNTER(reclaim_device_erased_checkpoints, "context_reclaim_device_erased_checkpoints_total",
+            "Checkpoints erased by Device-pressure release actions.");
+    COUNTER(reclaim_spilled_demotions, "context_reclaim_spilled_demotions_total",
+            "Device-pressure demotions whose Host victims the SSD tier took whole.");
+    if (stats.cold_enabled) {
+        gauge("ssd_context_disabled", stats.cold_disabled ? 1 : 0,
+              "1 after the SSD tier disabled itself on repeated I/O failures or a stuck I/O.");
+        GAUGE(cold_capacity_bytes, "ssd_context_capacity_bytes", "SSD tier file capacity.");
+        GAUGE(cold_segment_bytes, "ssd_context_segment_bytes", "Allocated SSD segment files.");
+        GAUGE(cold_occupied_bytes, "ssd_context_used_bytes",
+              "Object bytes held in SSD slots.");
+        GAUGE(cold_only_main_kv_pages, "ssd_context_cold_only_kv_pages",
+              "Main KV pages whose only replica is on the SSD.");
+        GAUGE(cold_only_states, "ssd_context_cold_only_states",
+              "StateImages whose only replica is on the SSD.");
+        GAUGE(cold_write_bytes_24h, "ssd_context_written_bytes_24h",
+              "Bytes written to the SSD tier in the trailing 24 hours, including the probe.");
+        COUNTER(cold_write_bytes, "ssd_context_written_bytes_total",
+                "Bytes written to the SSD tier, including the startup probe.");
+        COUNTER(cold_read_bytes, "ssd_context_read_bytes_total", "Bytes read from the SSD tier.");
+        COUNTER(cold_checksum_failures, "ssd_context_checksum_failures_total",
+                "SSD copies that failed their checksum.");
+        COUNTER(cold_spills_completed, "ssd_context_spills_total",
+                "Host-pressure spills that reached the SSD.");
+        COUNTER(cold_erased_checkpoints, "ssd_context_erased_checkpoints_total",
+                "Host-pressure victims erased without an SSD copy while the tier is configured.");
+        COUNTER(cold_restores_completed, "ssd_context_restores_total",
+                "SSD-to-Host restores that published Host replicas.");
+        COUNTER(cold_restores_failed, "ssd_context_restore_failures_total",
+                "SSD-to-Host restores that failed to read or verify.");
+        GAUGE(cold_demote_window_seconds, "ssd_context_demote_window_seconds",
+              "Age rule: victims idle longer are erased instead of demoted to the SSD.");
+        GAUGE(cold_prewrite_watermark_percent, "ssd_context_prewrite_watermark_percent",
+              "Free Host context percentage below which victims are pre-written to the SSD.");
+        COUNTER(cold_expired_erasures, "ssd_context_expired_erasures_total",
+                "Host-pressure victims erased by the age rule, oldest first.");
+        COUNTER(cold_evictions, "ssd_context_evictions_total",
+                "Checkpoints evicted from a full SSD tier for newer victims.");
+        COUNTER(cold_evicted_bytes, "ssd_context_evicted_bytes_total",
+                "SSD copy bytes released by SSD-full evictions.");
+        COUNTER(cold_prewrites, "ssd_context_prewrites_total",
+                "Checkpoints pre-written to the SSD below the Host free watermark.");
+        COUNTER(cold_prewrite_wasted, "ssd_context_prewrite_wasted_total",
+                "Pre-written checkpoints erased or evicted before a demotion used the copy.");
+    }
 #undef GAUGE
 #undef COUNTER
 

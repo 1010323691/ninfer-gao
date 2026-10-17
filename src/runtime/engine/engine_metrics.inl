@@ -163,6 +163,9 @@ void EngineCore<Instance>::publish_runtime_stats() {
     std::optional<nvtx::ScopedRange> detail_range;
     detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
     RuntimeStats snapshot                     = cumulative_stats_;
+    snapshot.reclaim_erased_checkpoints       = resources_.reclaim_erasures();
+    snapshot.reclaim_device_erased_checkpoints = resources_.device_release_erasures();
+    snapshot.reclaim_spilled_demotions        = resources_.spilled_demotions();
     const auto physical                       = instance_.program->physical_usage();
     snapshot.device_state_occupied_slots      = physical.occupied.state_slots;
     snapshot.device_main_kv_occupied_pages    = physical.occupied.main_kv_pages;
@@ -181,6 +184,35 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.host_context_reserved_bytes      = physical.host_reserved_bytes;
     snapshot.host_context_peak_occupied_bytes = physical.host_peak_occupied_bytes;
     snapshot.materializing_requests           = materializing_.has_value() ? 1U : 0U;
+    if (instance_.program->cold_enabled()) {
+        const auto cold                      = instance_.program->cold_usage();
+        snapshot.cold_enabled                = true;
+        snapshot.cold_disabled               = cold.disabled;
+        snapshot.cold_capacity_bytes         = cold.capacity_bytes;
+        snapshot.cold_segment_bytes          = cold.segment_bytes;
+        snapshot.cold_occupied_bytes         = cold.occupied_bytes;
+        snapshot.cold_segments               = cold.segments;
+        snapshot.cold_main_kv_pages          = cold.main_pages;
+        snapshot.cold_backend_kv_pages       = cold.backend_pages;
+        snapshot.cold_states                 = cold.states;
+        snapshot.cold_only_main_kv_pages     = cold.cold_only_main_pages;
+        snapshot.cold_only_backend_kv_pages  = cold.cold_only_backend_pages;
+        snapshot.cold_only_states            = cold.cold_only_states;
+        snapshot.cold_write_bytes            = cold.write_bytes;
+        snapshot.cold_read_bytes             = cold.read_bytes;
+        snapshot.cold_write_bytes_24h        = cold.write_bytes_24h;
+        snapshot.cold_write_failures         = cold.write_failures;
+        snapshot.cold_read_failures          = cold.read_failures;
+        snapshot.cold_checksum_failures      = cold.checksum_failures;
+        snapshot.cold_inflight_write_bytes   = cold.inflight_write_bytes;
+        snapshot.cold_inflight_read_bytes    = cold.inflight_read_bytes;
+        snapshot.cold_jobs                   = cold.jobs;
+        snapshot.cold_probe_write_bytes_per_second = cold.probe_write_bytes_per_second;
+        snapshot.cold_probe_read_bytes_per_second  = cold.probe_read_bytes_per_second;
+        snapshot.cold_demote_window_seconds        = static_cast<std::uint32_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(*cold_demote_window_).count());
+        snapshot.cold_prewrite_watermark_percent = cold_prewrite_watermark_percent_;
+    }
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }
         ++snapshot.running_requests;

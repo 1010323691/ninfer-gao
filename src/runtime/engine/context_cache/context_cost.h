@@ -43,6 +43,9 @@ struct ContextMachineCostModel {
     // Direction order is DeviceToHost, HostToDevice, DeviceToDevice.
     std::array<ContextTransferCost, 3> transfer{};
     ContextPrefillCost prefill;
+    // ColdToHost (SSD tier read). Not a preset entry: startup derives it from the tier's own
+    // probe of the configured directory, and it is unused while the tier is absent.
+    ContextTransferCost cold_read{.batch_ns = 200'000, .ns_per_byte_q32 = kContextCostQ32One};
 
     // max(batch + copy_operations * operation, payload_bytes * ns_per_byte)
     [[nodiscard]] std::uint64_t transfer_ns(ContextTransferDirection direction,
@@ -52,6 +55,9 @@ struct ContextMachineCostModel {
     [[nodiscard]] friend constexpr bool
     operator==(const ContextMachineCostModel&, const ContextMachineCostModel&) noexcept = default;
 };
+
+// Cold-read cost from a measured sequential read rate; latency covers submission and checksum.
+[[nodiscard]] ContextTransferCost cold_read_transfer_cost(double read_bytes_per_second) noexcept;
 
 [[nodiscard]] std::uint64_t price_context_transfer_requirements(
     const ContextMachineCostModel& model,

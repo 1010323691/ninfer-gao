@@ -298,6 +298,36 @@ MemorySummary Program::memory_summary() const noexcept { return impl_->memory_su
 
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 
+bool Program::cold_enabled() const noexcept { return impl_->cold_store != nullptr; }
+
+ColdUsage Program::cold_usage() const { return impl_->cold_usage(); }
+
+ColdQuote Program::cold_quote(std::span<const CheckpointHandle> checkpoints) const {
+    return impl_->cold_quote(checkpoints);
+}
+
+ColdStart Program::start_spill(std::span<const CheckpointHandle> checkpoints) {
+    return impl_->start_spill(checkpoints);
+}
+
+std::size_t Program::release_cold_host(std::span<const CheckpointHandle> checkpoints) {
+    return impl_->release_cold_host(checkpoints);
+}
+
+ColdStart Program::start_restore(CheckpointHandle checkpoint) {
+    return impl_->start_restore(checkpoint);
+}
+
+std::vector<ColdCompletion> Program::poll_cold() { return impl_->poll_cold(); }
+
+bool Program::cancel_cold(ColdJobId job) { return impl_->cancel_cold(job); }
+
+std::uint64_t Program::drop_cold(std::span<const CheckpointHandle> checkpoints) {
+    return impl_->drop_cold(checkpoints);
+}
+
+bool Program::has_cold_jobs() const noexcept { return !impl_->cold_jobs.empty(); }
+
 SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
                                       DeviceContext& device, const EngineOptions& options,
                                       std::optional<std::size_t> measured_graph_allowance_bytes) {
@@ -310,8 +340,10 @@ std::size_t measure_cuda_graph_allocation_bytes(const execution::Parameters& par
                                                const EngineOptions& options) {
     if (!options.use_cuda_graph) { return 0; }
     auto calibration = options;
-    // Host backing does not affect graph topology; do not pin it during calibration.
+    // Host backing and the SSD tier do not affect graph topology; do not pin Host memory, lock
+    // the SSD directory or run its probe during calibration.
     calibration.context_cache.host_capacity_bytes = 0;
+    calibration.context_cache.cold_directory.clear();
     auto planner = make_sequence_planner(parameters, device, calibration);
     const auto pages = planner.capacity_curve().minimum_main_page_groups;
     auto plan = std::move(planner).finalize(pages);

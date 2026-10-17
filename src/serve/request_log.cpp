@@ -334,7 +334,10 @@ Json scheduling_json(const ninfer::GenerationSchedulingStats& stats) {
                 {"replayed_tokens", stats.replayed_tokens},
                 {"paused_ns", stats.paused_ns},
                 {"device_to_host_bytes", stats.device_to_host_bytes},
-                {"host_to_device_bytes", stats.host_to_device_bytes}};
+                {"host_to_device_bytes", stats.host_to_device_bytes},
+                {"cold_restores", stats.cold_restores},
+                {"cold_to_host_bytes", stats.cold_to_host_bytes},
+                {"cold_restore_wait_ns", stats.cold_restore_wait_ns}};
 }
 
 Json admission_json(const ninfer::GenerationAdmissionStats& stats) {
@@ -357,6 +360,12 @@ Json admission_json(const ninfer::GenerationAdmissionStats& stats) {
         break;
     case ninfer::AdmissionFallbackReason::IsolatedCapacity:
         reason = "isolated_capacity";
+        break;
+    case ninfer::AdmissionFallbackReason::ColdUnavailable:
+        reason = "cold_unavailable";
+        break;
+    case ninfer::AdmissionFallbackReason::ColdChecksum:
+        reason = "cold_checksum";
         break;
     }
     if (!reason) { throw std::logic_error("invalid admission fallback reason"); }
@@ -551,7 +560,19 @@ std::string format_server_start_json(
              {"context_cache", Json{{"enabled", cache.enabled},
                                     {"device_state_slots", cache.device_state_slots.value()},
                                     {"total_device_state_slots", total_device_state_slots},
-                                    {"host_capacity_bytes", cache.host_capacity_bytes.value()}}}};
+                                    {"host_capacity_bytes", cache.host_capacity_bytes.value()},
+                                    {"ssd_directory", cache.cold_directory.string()},
+                                    {"ssd_capacity_bytes", cache.cold_directory.empty()
+                                                               ? 0
+                                                               : cache.cold_capacity_bytes},
+                                    {"ssd_demote_window_seconds",
+                                     cache.cold_directory.empty()
+                                         ? 0
+                                         : cache.cold_demote_window_seconds},
+                                    {"ssd_prewrite_watermark_percent",
+                                     cache.cold_directory.empty()
+                                         ? 0
+                                         : cache.cold_prewrite_watermark_percent}}}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
@@ -833,7 +854,14 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
          Json{{"spill_pages",
                monotonic_delta(previous.pressure_spill_pages, current.pressure_spill_pages)},
               {"partial_tail_cow_pages",
-               monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)}}},
+               monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
+              {"erased_checkpoints", monotonic_delta(previous.reclaim_erased_checkpoints,
+                                                     current.reclaim_erased_checkpoints)},
+              {"device_erased_checkpoints",
+               monotonic_delta(previous.reclaim_device_erased_checkpoints,
+                               current.reclaim_device_erased_checkpoints)},
+              {"spilled_demotions", monotonic_delta(previous.reclaim_spilled_demotions,
+                                                    current.reclaim_spilled_demotions)}}},
         {"occupancy",
          Json{{"device_state_slots", current.device_state_occupied_slots},
               {"host_state_slots", current.host_state_occupied_slots},
@@ -845,6 +873,54 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
               {"host_context_reserved_bytes", current.host_context_reserved_bytes}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
+    if (current.cold_enabled) {
+        const auto delta = [&](std::uint64_t ninfer::RuntimeStats::*field) {
+            return monotonic_delta(previous.*field, current.*field);
+        };
+        using S = ninfer::RuntimeStats;
+        record["context_cache"]["cold"] = Json{
+            {"disabled", current.cold_disabled},
+            {"capacity_bytes", current.cold_capacity_bytes},
+            {"segments", current.cold_segments},
+            {"segment_bytes", current.cold_segment_bytes},
+            {"occupied_bytes", current.cold_occupied_bytes},
+            {"main_kv_pages", current.cold_main_kv_pages},
+            {"backend_kv_pages", current.cold_backend_kv_pages},
+            {"states", current.cold_states},
+            {"cold_only_main_kv_pages", current.cold_only_main_kv_pages},
+            {"cold_only_backend_kv_pages", current.cold_only_backend_kv_pages},
+            {"cold_only_states", current.cold_only_states},
+            {"inflight_write_bytes", current.cold_inflight_write_bytes},
+            {"inflight_read_bytes", current.cold_inflight_read_bytes},
+            {"jobs", current.cold_jobs},
+            {"write_bytes_total", current.cold_write_bytes},
+            {"write_bytes_24h", current.cold_write_bytes_24h},
+            {"write_bytes", delta(&S::cold_write_bytes)},
+            {"read_bytes", delta(&S::cold_read_bytes)},
+            {"write_failures", delta(&S::cold_write_failures)},
+            {"read_failures", delta(&S::cold_read_failures)},
+            {"checksum_failures", delta(&S::cold_checksum_failures)},
+            {"spills_started", delta(&S::cold_spills_started)},
+            {"spills_completed", delta(&S::cold_spills_completed)},
+            {"spills_failed", delta(&S::cold_spills_failed)},
+            {"spill_host_bytes_released", delta(&S::cold_spill_host_bytes_released)},
+            {"erased_checkpoints", delta(&S::cold_erased_checkpoints)},
+            {"expired_erasures", delta(&S::cold_expired_erasures)},
+            {"evictions", delta(&S::cold_evictions)},
+            {"evicted_bytes", delta(&S::cold_evicted_bytes)},
+            {"prewrites", delta(&S::cold_prewrites)},
+            {"prewrite_wasted", delta(&S::cold_prewrite_wasted)},
+            {"restores_started", delta(&S::cold_restores_started)},
+            {"restores_completed", delta(&S::cold_restores_completed)},
+            {"restores_cancelled", delta(&S::cold_restores_cancelled)},
+            {"restores_failed", delta(&S::cold_restores_failed)},
+            {"lost_checkpoints", delta(&S::cold_lost_checkpoints)},
+            {"restore_bytes", delta(&S::cold_restore_bytes)},
+            {"restore_seconds",
+             monotonic_delta(previous.cold_restore_seconds, current.cold_restore_seconds)},
+            {"probe_write_bytes_per_second", current.cold_probe_write_bytes_per_second},
+            {"probe_read_bytes_per_second", current.cold_probe_read_bytes_per_second}};
+    }
     return record.dump();
 }
 

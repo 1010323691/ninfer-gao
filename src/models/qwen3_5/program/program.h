@@ -170,6 +170,9 @@ struct SourceCandidate {
     bool move_history   = false;
     bool split_state    = false;
     bool backup_state   = false;
+    // Some covered State/KV exists only on the SSD tier. Binding requires start_restore() first;
+    // transfers then include its ColdToHost bytes.
+    bool cold_restore = false;
     // Compatible carry intent. Binding may consume the selected point if its State slot
     // is necessary for execution and no preservation destination can be obtained.
     std::vector<CheckpointHandle> private_points;
@@ -181,6 +184,8 @@ struct BindingReservation {
     bool reserved          = false;
     bool source_valid      = true;
     bool capacity_possible = true;
+    // The source still has cold-only content; restore it to Host and retry.
+    bool cold_restore = false;
     runtime::ContextResourceUsage shortage;
     std::vector<CheckpointHandle> retired_points;
     std::optional<CheckpointHandle> consumed_source;
@@ -399,6 +404,106 @@ struct PhysicalUsageSnapshot {
     std::size_t host_kv_bytes            = 0;
 };
 
+// SSD tier (Native mechanism only; Runtime decides what to spill, release or drop).
+using ColdJobId = std::uint64_t;
+enum class ColdJobKind : std::uint8_t { Spill, Restore };
+enum class ColdJobStatus : std::uint8_t { Completed, Cancelled, Failed, ChecksumFailed };
+enum class ColdStartStatus : std::uint8_t {
+    Started,       // job is new or (restore) already running for the same checkpoint
+    NothingToDo,   // no eligible object (already cold, partial tail, Device-only, ...)
+    Unavailable,   // tier not configured or Disabled
+    Busy,          // an object is pinned by another cold job
+    Full,          // tier capacity or file system space exhausted
+    HostShortage,  // restore cannot reserve its complete Host destination
+    InvalidSource, // stale checkpoint or content without any replica
+};
+
+struct ColdStart {
+    ColdStartStatus status = ColdStartStatus::Unavailable;
+    std::optional<ColdJobId> job;
+    std::uint64_t bytes    = 0; // object bytes this job moves
+    std::uint32_t objects  = 0;
+    std::size_t host_bytes = 0; // restore: complete Host destination
+};
+
+struct ColdCompletion {
+    ColdJobId job        = 0;
+    ColdJobKind kind     = ColdJobKind::Spill;
+    ColdJobStatus status = ColdJobStatus::Completed;
+    std::vector<CheckpointHandle> checkpoints;
+    // Restore failure: checkpoints left without any replica of some covered object.
+    std::vector<CheckpointHandle> lost;
+    std::uint64_t bytes          = 0; // successfully transferred object bytes
+    std::uint32_t objects        = 0;
+    std::uint32_t failed_objects = 0;
+    std::uint64_t elapsed_ns     = 0;
+};
+
+// Sampled tier facts; quantities are physical, never a policy ledger.
+struct ColdUsage {
+    bool enabled                       = false;
+    bool disabled                      = false;
+    std::uint64_t capacity_bytes       = 0;
+    std::uint64_t segment_bytes        = 0;
+    std::uint64_t occupied_bytes       = 0;
+    std::uint32_t segments             = 0;
+    std::uint64_t main_pages           = 0;
+    std::uint64_t backend_pages        = 0;
+    std::uint64_t states               = 0;
+    std::uint32_t cold_only_main_pages = 0;
+    std::uint32_t cold_only_backend_pages = 0;
+    std::uint32_t cold_only_states     = 0;
+    std::uint64_t write_count          = 0;
+    std::uint64_t read_count           = 0;
+    std::uint64_t write_bytes          = 0; // issued to the file system, including the probe
+    std::uint64_t read_bytes           = 0;
+    std::uint64_t write_bytes_24h      = 0;
+    std::uint64_t write_failures       = 0;
+    std::uint64_t read_failures        = 0;
+    std::uint64_t checksum_failures    = 0;
+    std::uint64_t inflight_write_bytes = 0;
+    std::uint64_t inflight_read_bytes  = 0;
+    std::uint32_t jobs                 = 0;
+    double probe_write_bytes_per_second = 0.0;
+    double probe_read_bytes_per_second  = 0.0;
+};
+
+// Why a checkpoint cannot be demoted to the SSD tier as a whole.
+enum class ColdDemotionBlock : std::uint8_t {
+    None,
+    Unavailable,  // no tier, or the tier disabled itself
+    Lost,         // a covered object has no replica
+    Busy,         // a covered object has an SSD transfer in flight
+    Unspillable,  // a Host object cannot be copied (a tail that a writer can still extend)
+    Unreleasable, // a Host replica is pinned, or the cold-only limit would be exceeded
+    Full,         // the SSD capacity cannot hold the missing copies
+};
+
+// Read-only facts for a set of checkpoints; shared objects count once.
+struct ColdQuote {
+    std::uint64_t write_bytes   = 0; // eligible objects without a current SSD copy
+    std::uint32_t write_objects = 0;
+    std::uint64_t cold_bytes    = 0; // objects that already have a current SSD copy
+    std::uint64_t restore_bytes = 0; // cold-only objects to read back before binding
+    std::uint32_t restore_objects = 0;
+    std::size_t restore_host_bytes = 0;
+    // Host bytes release_cold_host() could free once every eligible object is on the SSD; only
+    // checkpoints that can be demoted whole contribute.
+    std::size_t host_bytes_released_after_spill = 0;
+    // Host bytes that stay resident: every Host object of a checkpoint that cannot be demoted
+    // whole.
+    std::size_t host_bytes_retained = 0;
+    // Objects with only a Device replica (shared prefix pages other requests still use, or
+    // pages Device pressure has not demoted yet). They stay on the Device and neither block a
+    // whole demotion nor count toward it: whole covers every object that leaves the Host.
+    std::uint32_t device_only_objects = 0;
+    bool lost = false; // some covered object has no replica
+    // Every checkpoint can be demoted whole: each covered object gets a current SSD copy (a
+    // spill now plus copies that exist) and then every Host replica can be released.
+    bool whole = false;
+    ColdDemotionBlock block = ColdDemotionBlock::Unavailable; // first reason when !whole
+};
+
 class Program {
 public:
     ~Program() noexcept;
@@ -494,6 +599,24 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
+    [[nodiscard]] bool cold_enabled() const noexcept;
+    [[nodiscard]] ColdUsage cold_usage() const;
+    [[nodiscard]] ColdQuote cold_quote(std::span<const CheckpointHandle> checkpoints) const;
+    // Writes Host replicas of committed pages (partial tails without a writer included) and
+    // immutable StateImages without an SSD copy. The Host replicas stay; they are pinned only
+    // until the job completes.
+    [[nodiscard]] ColdStart start_spill(std::span<const CheckpointHandle> checkpoints);
+    // Demotes whole checkpoints: releases every Host replica of a checkpoint only when each of
+    // its covered objects has a current SSD copy and every release is possible; any other
+    // checkpoint keeps all of its Host replicas. Returns released Host bytes.
+    [[nodiscard]] std::size_t release_cold_host(std::span<const CheckpointHandle> checkpoints);
+    // Reads every cold-only object of one checkpoint into a complete Host destination.
+    [[nodiscard]] ColdStart start_restore(CheckpointHandle checkpoint);
+    [[nodiscard]] std::vector<ColdCompletion> poll_cold();
+    [[nodiscard]] bool cancel_cold(ColdJobId job);
+    // Releases redundant SSD copies (objects that keep a Device or Host replica).
+    [[nodiscard]] std::uint64_t drop_cold(std::span<const CheckpointHandle> checkpoints);
+    [[nodiscard]] bool has_cold_jobs() const noexcept;
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;
     std::unique_ptr<detail::ProgramImpl> impl_;

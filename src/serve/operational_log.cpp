@@ -452,6 +452,13 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     logger_->info("context | history {} | {} active + {} extra device states | host {}",
                   cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
                   product::format_pretty_bytes(*cache.host_capacity_bytes));
+    if (!cache.cold_directory.empty()) {
+        logger_->info("context | SSD tier {} | capacity {} | demote window {} s | pre-write "
+                      "below {}% free Host",
+                      cache.cold_directory.string(),
+                      product::format_pretty_bytes(cache.cold_capacity_bytes),
+                      cache.cold_demote_window_seconds, cache.cold_prewrite_watermark_percent);
+    }
 
     if (service.options().enable_vision) {
         const ninfer::MediaCacheSummary media = service.media_cache_summary();

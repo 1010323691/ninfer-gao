@@ -54,6 +54,11 @@ public:
     using ControlMembership  = typename Scheduling::ControlMembership;
     using ResourceManagement = ResourceManager<ModelContract>;
     using Clock              = std::chrono::steady_clock;
+    using ColdJobId          = typename ModelContract::ColdJobId;
+    using ColdJobKind        = typename ModelContract::ColdJobKind;
+    using ColdJobStatus      = typename ModelContract::ColdJobStatus;
+    using ColdStartStatus    = typename ModelContract::ColdStartStatus;
+    using ColdDemotionBlock  = typename ModelContract::ColdDemotionBlock;
 
     class RoundMasks final : public TokenMaskProvider {
     public:
@@ -80,12 +85,30 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
-          resources_(options.context_cache.enabled, std::move(context_cost)) {
+          resources_(options.context_cache.enabled, std::move(context_cost)),
+          cold_demote_window_(
+              std::chrono::seconds(options.context_cache.cold_demote_window_seconds)),
+          cold_prewrite_watermark_percent_(options.context_cache.cold_prewrite_watermark_percent) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         paused_.reserve(max_outstanding_);
+        if (instance_.program->cold_enabled()) {
+            resources_.set_host_victim_policy(
+                {.dispose = [this](typename ModelContract::Program& program,
+                                   std::span<const Checkpoint> victims) {
+                     return dispose_host_victims(program, victims);
+                 },
+                 .erased =
+                     [this](typename ModelContract::Program& program,
+                            std::span<const Checkpoint> victims) {
+                         return split_host_victims(program, victims, false).erase;
+                     },
+                 // A watermark pre-write pins its objects; Host reclaim waits for it as well.
+                 .pending       = [this] { return pressure_spill_ || prewrite_; },
+                 .demote_window = cold_demote_window_});
+        }
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -522,6 +545,9 @@ private:
         std::vector<typename ResourceManagement::SourceChoice> sources;
         std::size_t current = 0;
         typename ResourceManagement::ReclaimCursor reclaim;
+        // The selected source waits for SSD-tier work (its restore or a Host-pressure spill).
+        // Like a context transaction, it keeps this decision until a cold completion arrives.
+        bool awaiting_cold = false;
     };
 
     struct CaptureDecision {
@@ -696,6 +722,7 @@ private:
             request->admission.revoked_checkpoints = resources_.source_revocations(request->id);
             finish_source_wait(request, Clock::now());
         }
+        drop_cold_waiter(*request);
         resources_.release_source(*instance_.program, request->id);
         if (request->continuation_owner) {
             resources_.abandon(*instance_.program, request->continuation_owner);
@@ -765,6 +792,9 @@ private:
         result.scheduling.paused_ns            = request->paused_ns;
         result.scheduling.device_to_host_bytes = request->device_to_host_bytes;
         result.scheduling.host_to_device_bytes = request->host_to_device_bytes;
+        result.scheduling.cold_restores        = request->cold_restores;
+        result.scheduling.cold_to_host_bytes   = request->cold_to_host_bytes;
+        result.scheduling.cold_restore_wait_ns = request->cold_restore_wait_ns;
         result.prompt                          = request->prompt_summary;
         result.generated_token_ids             = std::move(request->generated);
         result.content                         = std::move(request->content);
@@ -1252,7 +1282,9 @@ private:
                 if (const auto victims = resources_.host_victims(
                         *instance_.program, capture->host_bytes, std::nullopt, {}, {}, admission,
                         &decision->reclaim)) {
-                    resources_.commit_host_victims(*instance_.program, *victims, decision->reclaim);
+                    const auto host = resources_.commit_host_victims(*instance_.program, *victims,
+                                                                     decision->reclaim);
+                    if (host == ReclaimProgress::Spilling) { return false; }
                     if (!victims->empty()) { scheduler_.capacity_released(); }
                     if (const auto retry = instance_.program->prepare_capture(*request->sequence);
                         retry && retry->reserved) {
@@ -1263,7 +1295,10 @@ private:
             }
             const auto progress =
                 resources_.reclaim(*instance_.program, capture->shortage, {}, decision->reclaim);
-            if (progress == ReclaimProgress::Transferring) { return false; }
+            if (progress == ReclaimProgress::Transferring ||
+                progress == ReclaimProgress::Spilling) {
+                return false;
+            }
             if (progress == ReclaimProgress::Changed) { continue; }
             instance_.program->skip_capture(*request->sequence);
             decision.reset();
@@ -1509,29 +1544,36 @@ private:
         return true;
     }
 
-    bool reclaim(ContextResourceUsage shortage, bool allow_pause,
-                 std::span<const Checkpoint> excluded               = {},
-                 typename ResourceManagement::ReclaimCursor* cursor = nullptr,
-                 std::optional<std::uint64_t> priority_ticket       = std::nullopt) {
+    // Progress: capacity changed or a context transaction started. Wait: Host bytes come from
+    // an SSD write still in flight; retry after its cold completion.
+    enum class ReclaimOutcome : std::uint8_t { None, Progress, Wait };
+
+    ReclaimOutcome reclaim(ContextResourceUsage shortage, bool allow_pause,
+                           std::span<const Checkpoint> excluded               = {},
+                           typename ResourceManagement::ReclaimCursor* cursor = nullptr,
+                           std::optional<std::uint64_t> priority_ticket       = std::nullopt) {
         if (!shortage.state_slots && !shortage.main_kv_pages && !shortage.backend_kv_pages &&
             !shortage.host_bytes) {
-            return false;
+            return ReclaimOutcome::None;
         }
         if (instance_.program->reclaim_capture_reservation(shortage)) {
             request_admission_check();
-            return true;
+            return ReclaimOutcome::Progress;
         }
         const auto progress =
             cursor ? resources_.reclaim(*instance_.program, shortage, excluded, *cursor)
                    : resources_.reclaim(*instance_.program, shortage, excluded);
+        if (progress == ReclaimProgress::Spilling) { return ReclaimOutcome::Wait; }
         if (progress != ReclaimProgress::Blocked) {
             if (progress == ReclaimProgress::Changed) {
                 scheduler_.capacity_released();
                 request_admission_check();
             }
-            return true;
+            return ReclaimOutcome::Progress;
         }
-        if (cursor && cursor->rights.purpose != ReclaimPurpose::Execution) { return false; }
+        if (cursor && cursor->rights.purpose != ReclaimPurpose::Execution) {
+            return ReclaimOutcome::None;
+        }
         for (auto it = paused_.rbegin(); it != paused_.rend(); ++it) {
             auto& request = **it;
             if (!request.suspended || !request.suspended->has_snapshot()) { continue; }
@@ -1549,10 +1591,11 @@ private:
                     admission_decision_.reset();
                 }
                 request_admission_check();
-                return true;
+                return ReclaimOutcome::Progress;
             }
         }
-        return allow_pause && pause_reclaim_victim(priority_ticket);
+        return allow_pause && pause_reclaim_victim(priority_ticket) ? ReclaimOutcome::Progress
+                                                                    : ReclaimOutcome::None;
     }
 
     bool pause_reclaim_victim(std::optional<std::uint64_t> priority_ticket) {
@@ -1583,7 +1626,13 @@ private:
                 for (const auto handle : *victims) {
                     const auto usage = instance_.program->physical_usage();
                     if (usage.capacity.host_bytes - usage.occupied.host_bytes >= *bytes) { break; }
-                    if (resources_.erase(*instance_.program, handle)) { continue; }
+                    if (resources_.erase(*instance_.program, handle)) {
+                        // A pause cannot wait for an SSD write; the victim is erased, counted.
+                        if (instance_.program->cold_enabled()) {
+                            ++cumulative_stats_.cold_erased_checkpoints;
+                        }
+                        continue;
+                    }
                     const auto owner =
                         std::find_if(paused_.begin(), paused_.end(), [&](const auto& other) {
                             return other->suspended &&
@@ -1616,6 +1665,389 @@ private:
         context_owner_ = request;
         capture_decisions_[lane].reset();
         scheduler_.preempted();
+        return true;
+    }
+
+    // Classification of Host victims by the SSD-tier policy. `keep` are demoted whole (one
+    // write batch); `erase` are erased on demand; the rest stay in Host for a later batch.
+    struct VictimSplit {
+        std::vector<Checkpoint> keep, erase;
+        std::uint64_t expired = 0;
+    };
+
+    // The single classification behind both the read-only `erased` quote (commit false) and
+    // dispose (commit true): victims past the demote window are erased; the others are demoted
+    // whole, within one write batch. When the SSD is full, the oldest evictable SSD content is
+    // evicted for them, except for victims older than that content, which are erased instead.
+    VictimSplit split_host_victims(typename ModelContract::Program& program,
+                                   std::span<const Checkpoint> victims, bool commit) {
+        VictimSplit out;
+        std::uint64_t batch_bytes = 0;
+        for (const auto victim : victims) {
+            if (resources_.expired(victim)) {
+                    out.erase.push_back(victim);
+                ++out.expired;
+                continue;
+            }
+            const auto quote = program.cold_quote({&victim, 1});
+            if (!quote.whole && quote.block != ColdDemotionBlock::Full) {
+                out.erase.push_back(victim);
+                continue;
+            }
+            // A bounded batch keeps Device pressure from waiting on an unbounded write; the
+            // first victim always fits, the rest wait in Host for the next batch.
+            if (!out.keep.empty() && batch_bytes + quote.write_bytes > kColdWriteBatchBytes) {
+                continue;
+            }
+            batch_bytes += quote.write_bytes;
+            out.keep.push_back(victim);
+        }
+        if (out.keep.empty()) { return out; }
+        const auto batch = program.cold_quote(out.keep);
+        if (batch.whole) { return out; }
+        if (batch.block == ColdDemotionBlock::Full) {
+            for (;;) {
+                const auto oldest = oldest_evictable(program, victims);
+                if (!oldest) { break; }
+                // Never evict newer SSD content for a victim that is older than it.
+                const auto idle = resources_.idle_for(*oldest);
+                for (auto it = out.keep.begin(); it != out.keep.end();) {
+                    if (resources_.idle_for(*it) > idle) {
+                        out.erase.push_back(*it);
+                        it = out.keep.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                if (out.keep.empty() || program.cold_quote(out.keep).whole) { return out; }
+                // The quote assumes eviction makes room; dispose performs it.
+                if (!commit) { return out; }
+                evict_cold(program, *oldest);
+                if (program.cold_quote(out.keep).whole) { return out; }
+            }
+        }
+        out.erase.insert(out.erase.end(), out.keep.begin(), out.keep.end());
+        out.keep.clear();
+        return out;
+    }
+
+    // The SSD-resident checkpoint with the oldest real demand that may be evicted: not one of
+    // the victims, not waiting or held (a restore holds its checkpoint), with an SSD copy.
+    std::optional<Checkpoint> oldest_evictable(typename ModelContract::Program& program,
+                                               std::span<const Checkpoint> victims) {
+        std::erase_if(cold_resident_, [&](auto handle) {
+            if (!program.valid_checkpoint(handle)) { return true; }
+            const auto quote = program.cold_quote({&handle, 1});
+            return quote.cold_bytes == 0 && quote.restore_objects == 0;
+        });
+        std::optional<Checkpoint> oldest;
+        std::chrono::nanoseconds oldest_idle{};
+        for (const auto handle : cold_resident_) {
+            if (std::find(victims.begin(), victims.end(), handle) != victims.end() ||
+                resources_.pinned(handle)) {
+                continue;
+            }
+            const auto idle = resources_.idle_for(handle);
+            if (!oldest || idle > oldest_idle) {
+                oldest      = handle;
+                oldest_idle = idle;
+            }
+        }
+        return oldest;
+    }
+
+    // Evicts one checkpoint from the SSD without writing anything: a checkpoint that is still
+    // resident elsewhere drops its SSD copies; a cold-only one is erased whole.
+    void evict_cold(typename ModelContract::Program& program, Checkpoint handle) {
+        std::erase(cold_resident_, handle);
+        const auto quote    = program.cold_quote({&handle, 1});
+        std::uint64_t bytes = 0;
+        if (quote.restore_objects) {
+            if (!resources_.erase(program, handle)) { return; }
+            bytes = quote.cold_bytes + quote.restore_bytes;
+        } else {
+            bytes = program.drop_cold({&handle, 1});
+        }
+        ++cumulative_stats_.cold_evictions;
+        cumulative_stats_.cold_evicted_bytes += bytes;
+    }
+
+    // Host-victim policy of the SSD tier; this function is the replaceable strategy point (its
+    // classification is split_host_victims). The age rule moved expired victims first in the
+    // Host reclaim order; the order is otherwise unchanged.
+    typename ResourceManagement::HostVictimDisposal
+    dispose_host_victims(typename ModelContract::Program& program,
+                         std::span<const Checkpoint> victims) {
+        auto split = split_host_victims(program, victims, true);
+        cumulative_stats_.cold_expired_erasures += split.expired;
+        if (!split.keep.empty()) {
+            const auto start = program.start_spill(split.keep);
+            if (start.status == ColdStartStatus::Started) {
+                ++cumulative_stats_.cold_spills_started;
+                cumulative_stats_.cold_erased_checkpoints += split.erase.size();
+                pressure_spill_.emplace(PressureSpill{*start.job, std::move(split.keep)});
+                return {.pending = true, .erase = std::move(split.erase)};
+            }
+            // Every object already has a current SSD copy (a pre-write): release at once.
+            const auto released = start.status == ColdStartStatus::NothingToDo
+                                      ? program.release_cold_host(split.keep)
+                                      : 0;
+            if (released) {
+                cumulative_stats_.cold_spill_host_bytes_released += released;
+                cumulative_stats_.cold_erased_checkpoints += split.erase.size();
+                return {.erase = std::move(split.erase)};
+            }
+            // Full despite the quote (file system space), Unavailable, or nothing released.
+            split.erase.insert(split.erase.end(), split.keep.begin(), split.keep.end());
+        }
+        cumulative_stats_.cold_erased_checkpoints += split.erase.size();
+        return {.erase = std::move(split.erase)};
+    }
+
+    // Watermark pre-write: below the Host free watermark, write the next Host victims inside the
+    // demote window to the SSD without releasing Host, so a later pressure demotion only
+    // releases. Still pressure driven, one bounded batch at a time.
+    bool maybe_prewrite() {
+        auto& program = *instance_.program;
+        if (!program.cold_enabled() || cold_prewrite_watermark_percent_ == 0 || pressure_spill_ ||
+            prewrite_) {
+            return false;
+        }
+        const auto now = Clock::now();
+        if (now < next_prewrite_check_) { return false; }
+        next_prewrite_check_ = now + std::chrono::milliseconds(100);
+        settle_prewritten(program);
+        if (program.has_context_transaction()) { return false; }
+        const auto usage    = program.physical_usage();
+        const auto capacity = static_cast<std::uint64_t>(usage.capacity.host_bytes);
+        const auto occupied = std::min<std::uint64_t>(capacity, usage.occupied.host_bytes);
+        if (!capacity ||
+            (capacity - occupied) * 100U >= capacity * cold_prewrite_watermark_percent_) {
+            return false;
+        }
+        std::vector<Checkpoint> batch;
+        std::uint64_t bytes = 0;
+        for (const auto handle : resources_.victim_order()) {
+            if (!program.valid_checkpoint(handle) || resources_.expired(handle)) { continue; }
+            const auto quote = program.cold_quote({&handle, 1});
+            if (!quote.whole || quote.write_objects == 0) { continue; }
+            if (!batch.empty() && bytes + quote.write_bytes > kColdWriteBatchBytes) { break; }
+            bytes += quote.write_bytes;
+            batch.push_back(handle);
+        }
+        if (batch.empty() || !program.cold_quote(batch).whole) { return false; }
+        const auto start = program.start_spill(batch);
+        if (start.status != ColdStartStatus::Started) { return false; }
+        prewrite_.emplace(PressureSpill{*start.job, std::move(batch)});
+        return true;
+    }
+
+    // Pre-written checkpoints are used once a pressure demotion releases their Host replicas;
+    // erased or evicted before that, the write was wasted.
+    void settle_prewritten(typename ModelContract::Program& program) {
+        std::erase_if(prewritten_, [&](auto handle) {
+            if (!program.valid_checkpoint(handle)) {
+                ++cumulative_stats_.cold_prewrite_wasted;
+                return true;
+            }
+            const auto quote = program.cold_quote({&handle, 1});
+            if (quote.restore_objects) { return true; }
+            if (quote.cold_bytes == 0) {
+                ++cumulative_stats_.cold_prewrite_wasted;
+                return true;
+            }
+            return false;
+        });
+    }
+
+    void register_cold_resident(typename ModelContract::Program& program,
+                                std::span<const Checkpoint> checkpoints) {
+        for (const auto handle : checkpoints) {
+            if (program.valid_checkpoint(handle) &&
+                std::find(cold_resident_.begin(), cold_resident_.end(), handle) ==
+                    cold_resident_.end()) {
+                cold_resident_.push_back(handle);
+            }
+        }
+    }
+
+    enum class ColdSource : std::uint8_t {
+        Wait,        // a cold job (this restore or a Host-pressure spill) must complete first
+        Transaction, // Host reclaim started a context transaction
+        Resident,    // nothing cold-only remains; bind again
+        Unavailable, // give the source up: tier disabled or failed, or Host cannot hold it
+        Invalid,     // the checkpoint lost a covered object
+    };
+
+    // Starts (or joins) the SSD-to-Host restore of a cold-only source. The complete Host
+    // destination is reserved before any read; a Host shortage goes through ordinary reclaim.
+    ColdSource prepare_cold_source(const std::shared_ptr<Request>& request,
+                                   const typename ResourceManagement::SourceChoice& choice,
+                                   bool restoring, AdmissionDecision& decision) {
+        auto& program = *instance_.program;
+        if (!choice.source.checkpoint) { return ColdSource::Invalid; }
+        const auto handle = *choice.source.checkpoint;
+        // The waiting reference protects the source like any waiting admission.
+        retain_admission_source(request, choice, restoring);
+        for (;;) {
+            const auto start = program.start_restore(handle);
+            switch (start.status) {
+            case ColdStartStatus::Started:
+                add_cold_waiter(*start.job, handle, request);
+                return ColdSource::Wait;
+            case ColdStartStatus::NothingToDo:
+                return ColdSource::Resident;
+            case ColdStartStatus::InvalidSource:
+                return ColdSource::Invalid;
+            case ColdStartStatus::Busy:
+                // Another cold job pins a covered object; its completion retries this source.
+                return program.has_cold_jobs() ? ColdSource::Wait : ColdSource::Unavailable;
+            case ColdStartStatus::HostShortage: {
+                const auto usage = program.physical_usage();
+                if (start.host_bytes > usage.capacity.host_bytes) {
+                    return ColdSource::Unavailable;
+                }
+                const auto free = usage.capacity.host_bytes - usage.occupied.host_bytes;
+                // A fragmented arena can refuse a destination that fits the free total.
+                const ContextResourceUsage shortage{
+                    .host_bytes = start.host_bytes > free ? start.host_bytes - free
+                                                          : start.host_bytes};
+                const auto outcome =
+                    reclaim(shortage, false, {&handle, 1}, &decision.reclaim,
+                            restoring ? std::optional(request->id) : std::nullopt);
+                if (outcome == ReclaimOutcome::None) { return ColdSource::Unavailable; }
+                if (program.has_context_transaction()) { return ColdSource::Transaction; }
+                if (outcome == ReclaimOutcome::Wait) { return ColdSource::Wait; }
+                continue;
+            }
+            case ColdStartStatus::Unavailable:
+            case ColdStartStatus::Full:
+                return ColdSource::Unavailable;
+            }
+            return ColdSource::Unavailable;
+        }
+    }
+
+    void add_cold_waiter(ColdJobId job, Checkpoint checkpoint,
+                         const std::shared_ptr<Request>& request) {
+        auto wait = std::find_if(cold_restores_.begin(), cold_restores_.end(),
+                                 [&](const auto& entry) { return entry.job == job; });
+        if (wait == cold_restores_.end()) {
+            // Engine-owned reference: a waiter leaving cannot release a checkpoint that Native
+            // pins until the restore completes.
+            resources_.hold(checkpoint);
+            ++cumulative_stats_.cold_restores_started;
+            wait = cold_restores_.insert(cold_restores_.end(),
+                                         ColdRestoreWait{.job = job, .checkpoint = checkpoint});
+        }
+        if (std::none_of(wait->waiters.begin(), wait->waiters.end(),
+                         [&](const auto& waiter) { return waiter.id == request->id; })) {
+            wait->waiters.push_back({request, request->id, Clock::now()});
+        }
+    }
+
+    // A request that leaves before its restore completes; the last waiter cancels the job.
+    void drop_cold_waiter(const Request& request) noexcept {
+        for (auto& wait : cold_restores_) {
+            if (!std::erase_if(wait.waiters,
+                               [&](const auto& waiter) { return waiter.id == request.id; })) {
+                continue;
+            }
+            if (wait.waiters.empty()) { (void)instance_.program->cancel_cold(wait.job); }
+        }
+    }
+
+    // Maintenance step: settles SSD-tier completions before admission and execution.
+    bool progress_cold_jobs() {
+        auto& program = *instance_.program;
+        if (!program.has_cold_jobs()) { return false; }
+        const auto completions = program.poll_cold();
+        if (completions.empty()) { return false; }
+        const auto now = Clock::now();
+        for (const auto& completion : completions) {
+            if (completion.kind == ColdJobKind::Spill) {
+                if (prewrite_ && prewrite_->job == completion.job) {
+                    if (completion.status == ColdJobStatus::Completed) {
+                        cumulative_stats_.cold_prewrites += prewrite_->checkpoints.size();
+                        register_cold_resident(program, prewrite_->checkpoints);
+                        for (const auto handle : prewrite_->checkpoints) {
+                            if (program.valid_checkpoint(handle)) { prewritten_.push_back(handle); }
+                        }
+                    } else {
+                        ++cumulative_stats_.cold_spills_failed;
+                    }
+                    prewrite_.reset();
+                    continue;
+                }
+                if (!pressure_spill_ || pressure_spill_->job != completion.job) { continue; }
+                if (completion.status == ColdJobStatus::Completed) {
+                    ++cumulative_stats_.cold_spills_completed;
+                    register_cold_resident(program, pressure_spill_->checkpoints);
+                    cumulative_stats_.cold_spill_host_bytes_released +=
+                        program.release_cold_host(pressure_spill_->checkpoints);
+                } else {
+                    // The victims keep their Host replicas; a later reclaim decides again.
+                    ++cumulative_stats_.cold_spills_failed;
+                }
+                pressure_spill_.reset();
+                continue;
+            }
+            const auto wait = std::find_if(cold_restores_.begin(), cold_restores_.end(),
+                                           [&](const auto& entry) {
+                                               return entry.job == completion.job;
+                                           });
+            const bool ok = completion.status == ColdJobStatus::Completed;
+            if (ok) {
+                ++cumulative_stats_.cold_restores_completed;
+                cumulative_stats_.cold_restore_bytes += completion.bytes;
+                cumulative_stats_.cold_restore_seconds +=
+                    static_cast<double>(completion.elapsed_ns) * 1.0e-9;
+            } else if (completion.status == ColdJobStatus::Cancelled) {
+                ++cumulative_stats_.cold_restores_cancelled;
+            } else {
+                ++cumulative_stats_.cold_restores_failed;
+            }
+            // Checkpoints left without any replica are unusable sources: drop their catalog
+            // entries (they would otherwise only fail every later inspection).
+            for (const auto lost : completion.lost) {
+                ++cumulative_stats_.cold_lost_checkpoints;
+                (void)resources_.erase(program, lost);
+            }
+            if (wait != cold_restores_.end()) {
+                for (const auto& waiter : wait->waiters) {
+                    const auto request = waiter.request.lock();
+                    if (!request) { continue; }
+                    if (ok) {
+                        ++request->cold_restores;
+                        request->cold_to_host_bytes += completion.bytes;
+                        request->cold_restore_wait_ns += elapsed_ns(waiter.since, now);
+                    } else if (completion.status != ColdJobStatus::Cancelled &&
+                               !request->suspended) {
+                        request->admission.fallback_reason =
+                            completion.status == ColdJobStatus::ChecksumFailed
+                                ? AdmissionFallbackReason::ColdChecksum
+                                : AdmissionFallbackReason::ColdUnavailable;
+                        // Dropping the lost source revoked this waiter's reference; the cold
+                        // failure, not a competing revocation, is its fallback reason.
+                        request->admission.revoked_checkpoints =
+                            resources_.source_revocations(request->id);
+                        // Select again without the unusable source.
+                        if (admission_decision_ && admission_decision_->request == request) {
+                            admission_decision_.reset();
+                        }
+                    }
+                }
+                const auto checkpoint = wait->checkpoint;
+                cold_restores_.erase(wait);
+                resources_.release_hold(program, checkpoint);
+            }
+        }
+        if (admission_decision_) {
+            // A failed restore leaves the decision on its now unusable source; it moves on.
+            admission_decision_->awaiting_cold = false;
+        }
+        scheduler_.capacity_released();
+        request_admission_check();
         return true;
     }
 
@@ -1655,6 +2087,7 @@ private:
              (restoring && (paused_.empty() || paused_.front() != admission_decision_->request)))) {
             admission_decision_.reset();
         }
+        if (admission_decision_ && admission_decision_->awaiting_cold) { return false; }
         std::vector<std::shared_ptr<Request>> candidates;
         if (admission_decision_) {
             candidates.push_back(admission_decision_->request);
@@ -1716,7 +2149,8 @@ private:
             }
             auto& decision = *admission_decision_;
             ContextResourceUsage shortage;
-            bool deferred = false;
+            bool deferred     = false;
+            bool cold_retried = false;
             while (decision.current < decision.sources.size()) {
                 auto& choice            = decision.sources[decision.current];
                 const bool own_snapshot = restoring && request->suspended->has_snapshot();
@@ -1759,6 +2193,27 @@ private:
                                  : 1U);
                 };
                 auto reservation = bind(choice.source);
+                if (reservation.cold_restore) {
+                    // Binding never reads the SSD: restore the cold-only content to Host first,
+                    // then bind again through the ordinary Host-to-Device restore.
+                    const auto cold = prepare_cold_source(request, choice, restoring, decision);
+                    if (cold == ColdSource::Wait) {
+                        decision.awaiting_cold = true;
+                        return true;
+                    }
+                    if (cold == ColdSource::Transaction) { return true; }
+                    if (cold == ColdSource::Resident && !cold_retried) {
+                        cold_retried = true;
+                        continue;
+                    }
+                    if (!restoring) {
+                        request->admission.fallback_reason =
+                            cold == ColdSource::Invalid ? AdmissionFallbackReason::SourceInvalid
+                                                        : AdmissionFallbackReason::ColdUnavailable;
+                    }
+                    ++decision.current;
+                    continue;
+                }
                 if (!reservation && !reservation.source_valid) {
                     if (!restoring) {
                         request->admission.fallback_reason =
@@ -1779,10 +2234,16 @@ private:
                     const auto excluded         = protected_source
                                                       ? std::span<const Checkpoint>(&*protected_source, 1)
                                                       : std::span<const Checkpoint>{};
-                    if (reclaim(shortage, restoring && !has_older_resident(request->id), excluded,
-                                &decision.reclaim,
-                                restoring ? std::optional(request->id) : std::nullopt)) {
+                    if (const auto outcome =
+                            reclaim(shortage, restoring && !has_older_resident(request->id),
+                                    excluded, &decision.reclaim,
+                                    restoring ? std::optional(request->id) : std::nullopt);
+                        outcome != ReclaimOutcome::None) {
                         if (instance_.program->has_context_transaction()) { return true; }
+                        if (outcome == ReclaimOutcome::Wait) {
+                            decision.awaiting_cold = true;
+                            return true;
+                        }
                         continue;
                     }
                     // Another waiting reference may be the only obstacle to a Move.
@@ -1990,8 +2451,13 @@ private:
                 }
                 if (instance_.program->has_context_transaction()) { break; }
                 if (!cursor) { cursor.emplace(resources_.begin_reclaim(*instance_.program)); }
-                if (reclaim(result.shortage, false, {}, &*cursor)) {
-                    if (!instance_.program->has_context_transaction()) { continue; }
+                if (const auto outcome = reclaim(result.shortage, false, {}, &*cursor);
+                    outcome != ReclaimOutcome::None) {
+                    // A pending SSD write releases its Host bytes at a later cold completion.
+                    if (outcome == ReclaimOutcome::Progress &&
+                        !instance_.program->has_context_transaction()) {
+                        continue;
+                    }
                     break;
                 }
                 if (recovering == lane) {
@@ -2165,6 +2631,15 @@ private:
             complete_error(request, error);
         }
         paused_.clear();
+        // Native shutdown completes them; the Engine only stops tracking them here.
+        for (const auto& wait : cold_restores_) { (void)instance_.program->cancel_cold(wait.job); }
+        if (pressure_spill_) { (void)instance_.program->cancel_cold(pressure_spill_->job); }
+        if (prewrite_) { (void)instance_.program->cancel_cold(prewrite_->job); }
+        cold_restores_.clear();
+        pressure_spill_.reset();
+        prewrite_.reset();
+        cold_resident_.clear();
+        prewritten_.clear();
         resources_.release_all(*instance_.program);
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
@@ -2182,7 +2657,8 @@ private:
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
-                    !instance_.program->has_context_transaction()) {
+                    !instance_.program->has_context_transaction() &&
+                    !instance_.program->has_cold_jobs()) {
                     queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
                 }
                 if (stopping_) {
@@ -2200,6 +2676,8 @@ private:
                 auto boundary = begin_host_phase();
                 (void)expire_pending_requests();
                 executed = progress_context_transaction(boundary);
+                executed |= progress_cold_jobs();
+                executed |= maybe_prewrite();
                 if (!instance_.program->has_context_transaction()) {
                     for (const auto& request : slots_) {
                         if (request && request->capture_pending) {
@@ -2381,6 +2859,34 @@ private:
     std::optional<AdmissionDecision> admission_decision_;
     std::uint64_t admission_generation_ = 1;
     std::array<std::optional<CaptureDecision>, kMaximumConcurrency> capture_decisions_;
+    // SSD tier work. One Host-pressure spill at a time; restores keyed by their Native job, each
+    // holding its checkpoint in ResourceManager until the job completes.
+    struct PressureSpill {
+        ColdJobId job = 0;
+        std::vector<Checkpoint> checkpoints;
+    };
+    struct ColdRestoreWaiter {
+        std::weak_ptr<Request> request;
+        std::uint64_t id = 0;
+        Clock::time_point since;
+    };
+    struct ColdRestoreWait {
+        ColdJobId job = 0;
+        Checkpoint checkpoint;
+        std::vector<ColdRestoreWaiter> waiters;
+    };
+    std::optional<PressureSpill> pressure_spill_;
+    std::optional<PressureSpill> prewrite_;
+    std::vector<ColdRestoreWait> cold_restores_;
+    // Checkpoints whose SSD copies the Engine wrote (eviction candidates; pruned lazily) and
+    // pre-written checkpoints whose use is not settled yet.
+    std::vector<Checkpoint> cold_resident_;
+    std::vector<Checkpoint> prewritten_;
+    // Upper bound of one pressure or pre-write batch (the store's in-flight write window).
+    static constexpr std::uint64_t kColdWriteBatchBytes = 2ULL << 30U;
+    std::optional<std::chrono::nanoseconds> cold_demote_window_;
+    std::uint32_t cold_prewrite_watermark_percent_ = 0;
+    Clock::time_point next_prewrite_check_{};
     std::shared_ptr<Request> context_owner_;
     std::vector<std::shared_ptr<Request>> paused_;
     Scheduling scheduler_;

@@ -1,5 +1,7 @@
 add_library(ninfer_core STATIC
   arena.cu
+  cold_context_store.cpp
+  crc32c.cpp
   device.cu
   dtype.cpp
   host_worker_pool.cpp
