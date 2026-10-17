@@ -1979,6 +1979,9 @@ private:
                             if (program.valid_checkpoint(handle)) { prewritten_.push_back(handle); }
                         }
                     } else {
+                        // Objects written before the failure keep their copies: track them so a
+                        // full SSD can evict them.
+                        register_cold_resident(program, prewrite_->checkpoints);
                         ++cumulative_stats_.cold_spills_failed;
                     }
                     prewrite_.reset();
@@ -1991,7 +1994,9 @@ private:
                     cumulative_stats_.cold_spill_host_bytes_released +=
                         program.release_cold_host(pressure_spill_->checkpoints);
                 } else {
-                    // The victims keep their Host replicas; a later reclaim decides again.
+                    // The victims keep their Host replicas; a later reclaim decides again. Objects
+                    // written before the failure keep their copies and stay evictable.
+                    register_cold_resident(program, pressure_spill_->checkpoints);
                     ++cumulative_stats_.cold_spills_failed;
                 }
                 pressure_spill_.reset();

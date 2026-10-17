@@ -630,70 +630,115 @@ bool ProgramImpl::cancel_cold(ColdJobId id) {
 std::size_t ProgramImpl::release_cold_host(std::span<const CheckpointHandle> handles) {
     if (!cold_store || !host_context_arena) { return 0; }
     const auto before = host_context_arena->occupied_bytes();
-    // A page some other holder (a checkpoint outside the batch or a running request) still
-    // references keeps its Host replica: releasing it would make that holder read it back from
-    // the SSD.
-    auto victim_holders = victim_page_holders(handles);
-    for (const auto handle : handles) {
-        if (!valid_checkpoint(handle)) { continue; }
-        // A checkpoint is demoted whole or not at all: every object it holds in Host needs a
-        // current SSD copy and every such Host replica must be releasable. Device-only objects
-        // and cold-only objects are not part of what leaves Host.
+
+    // What one checkpoint would release, decided without changing anything. A checkpoint is
+    // demoted whole or not at all: every object it holds in Host needs a current SSD copy and
+    // every such Host replica must be releasable. Device-only and cold-only objects are not part
+    // of what leaves Host. A page some other holder (a checkpoint outside the demoted set or a
+    // running request) still references keeps its Host replica, with its SSD copy: releasing it
+    // would make that holder read it back from the SSD.
+    struct Plan {
         bool whole = true;
-        ObjectSet local;
         std::optional<StateImageHandle> state;
         std::vector<HostKVPageReplicaRelease> releases;
-        std::uint32_t new_main = 0, new_backend = 0;
+        struct PageRef {
+            LogicalKVPageStore* store;
+            LogicalKVPageHandle page;
+            runtime::ContextResourceClass resource;
+        };
+        std::vector<PageRef> pages;
+    };
+    const auto plan_of = [&](CheckpointHandle handle, auto& holders) {
+        Plan plan;
+        ObjectSet local;
         visit_checkpoint_objects(
             checkpoint(handle),
             [&](StateImageHandle image) {
-                if (!whole || !local.insert_state(*state_store, image) ||
+                if (!plan.whole || !local.insert_state(*state_store, image) ||
                     state_store->cold_only(image)) {
                     return;
                 }
-                // A Device-only object does not leave Host: it stays where it is.
                 if (!state_store->host_resident(image)) { return; }
                 if (!state_store->cold_replica_current(image) ||
                     !state_store->can_drop_host_to_cold(image)) {
-                    whole = false;
+                    plan.whole = false;
                 } else {
-                    state = image;
+                    plan.state = image;
                 }
             },
             [&](LogicalKVPageStore& pages, LogicalKVPageHandle page,
                 runtime::ContextResourceClass resource) {
-                if (!whole || !local.insert_page(pages, page, resource) || pages.cold_only(page)) {
+                if (!plan.whole || !local.insert_page(pages, page, resource) ||
+                    pages.cold_only(page)) {
                     return;
                 }
-                // A Device-only object does not leave Host: it stays where it is.
                 if (!pages.host_resident(page)) { return; }
                 if (!pages.cold_replica_current(page) ||
                     !host_kv_extents->can_release_page_replica(pages, page)) {
-                    whole = false;
+                    plan.whole = false;
                     return;
                 }
-                // A page another holder still uses stays in Host (with its SSD copy).
                 if (pages.address_references(page) >
-                    victim_holders[shared_page_key(pages, page, resource)]) {
+                    holders[shared_page_key(pages, page, resource)]) {
                     return;
                 }
-                if (!pages.device_resident(page)) {
-                    ++(resource == runtime::ContextResourceClass::MainKV ? new_main : new_backend);
-                }
-                releases.push_back({&pages, page});
+                plan.releases.push_back({&pages, page});
+                plan.pages.push_back({&pages, page, resource});
             });
-        const auto fits = [](std::uint32_t added, const LogicalKVPageStore* pages) {
-            return added == 0 ||
-                   (pages && added <= pages->cold_only_limit() - pages->cold_only_pages());
-        };
-        if (!whole || !fits(new_main, text_kv_pages.get()) ||
-            !fits(new_backend, backend_kv_pages.get())) {
-            continue;
+        return plan;
+    };
+    // A shared page is released only when every holder of it is demoted, so a holder that turns
+    // out not to qualify withdraws its pages from the others: iterate to a fixed point.
+    std::vector<CheckpointHandle> eligible;
+    for (const auto handle : handles) {
+        if (valid_checkpoint(handle)) { eligible.push_back(handle); }
+    }
+    std::vector<Plan> plans;
+    for (;;) {
+        auto holders = victim_page_holders(eligible);
+        plans.clear();
+        std::vector<CheckpointHandle> next;
+        ObjectSet counted;
+        std::uint32_t new_main = 0, new_backend = 0;
+        for (const auto handle : eligible) {
+            auto plan = plan_of(handle, holders);
+            std::uint32_t added_main = 0, added_backend = 0;
+            if (plan.whole) {
+                for (const auto& ref : plan.pages) {
+                    if (ref.store->device_resident(ref.page) ||
+                        !counted.insert_page(*ref.store, ref.page, ref.resource)) {
+                        continue;
+                    }
+                    ++(ref.resource == runtime::ContextResourceClass::MainKV ? added_main : added_backend);
+                }
+                const auto fits = [](std::uint32_t total, std::uint32_t added,
+                                     const LogicalKVPageStore* pages) {
+                    return added == 0 || (pages && total + added <= pages->cold_only_limit() -
+                                                                        pages->cold_only_pages());
+                };
+                plan.whole = fits(new_main, added_main, text_kv_pages.get()) &&
+                             fits(new_backend, added_backend, backend_kv_pages.get());
+            }
+            if (plan.whole) {
+                new_main += added_main;
+                new_backend += added_backend;
+                next.push_back(handle);
+            }
+            plans.push_back(std::move(plan));
         }
-        if (!releases.empty() && !host_kv_extents->release_page_replicas(releases)) {
+        if (next.size() == eligible.size()) { break; }
+        eligible = std::move(next);
+    }
+    // Each shared page is released once, with the first holder that reaches it.
+    for (auto& plan : plans) {
+        if (!plan.whole) { continue; }
+        std::erase_if(plan.releases, [&](const HostKVPageReplicaRelease& release) {
+            return !release.pages->host_resident(release.page);
+        });
+        if (!plan.releases.empty() && !host_kv_extents->release_page_replicas(plan.releases)) {
             throw std::logic_error("cold Host release changed after its check");
         }
-        if (state && !state_store->drop_host_to_cold(*state)) {
+        if (plan.state && !state_store->drop_host_to_cold(*plan.state)) {
             throw std::logic_error("cold StateImage release changed after its check");
         }
     }
