@@ -241,7 +241,7 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
         GAUGE(cold_write_bytes_24h, "ssd_context_written_bytes_24h",
               "Bytes written to the SSD tier in the trailing 24 hours, including the probe.");
         COUNTER(cold_write_bytes, "ssd_context_written_bytes_total",
-                "Bytes written to the SSD tier, including the startup probe.");
+                "Bytes written to the SSD tier, including the startup probe (cumulative since process start).");
         COUNTER(cold_read_bytes, "ssd_context_read_bytes_total", "Bytes read from the SSD tier.");
         COUNTER(cold_checksum_failures, "ssd_context_checksum_failures_total",
                 "SSD copies that failed their checksum.");
