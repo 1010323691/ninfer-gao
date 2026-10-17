@@ -125,6 +125,8 @@ public:
         for (const auto& owner : owners_) {
             if (std::any_of(owner.points.begin(), owner.points.end(),
                             [&](const auto& point) { return point.handle == handle; })) {
+                // A running request keeps its history in use even before it publishes.
+                if (owner.active) { return std::chrono::nanoseconds{0}; }
                 include(owner.touched);
             }
         }
@@ -756,6 +758,9 @@ public:
         bool waits_for_host = false;
         for (std::size_t index = 0; index < actions.size(); ++index) {
             const auto& action = actions[index];
+            // A demotion ranked before this erasure waits for a write batch. Erasing past it
+            // would delete what the batch is about to make room for, so the erasure waits too.
+            if (waits_for_host && !action.demotion) { break; }
             if (action.demotion && !action.host_victims.empty() && host_victims_pending()) {
                 // Its Host destination depends on the batch still being written.
                 waits_for_host = true;

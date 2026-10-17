@@ -6,6 +6,7 @@
 #include <exception>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 // SSD tier mechanism. Spill copies immutable Host replicas to cold slots; restore reads cold-only
@@ -42,6 +43,13 @@ struct ObjectSet {
         return seen.insert(store.descriptor_index(page)).second;
     }
 };
+
+// Identifies one physical KV page across the Main and backend stores.
+std::uint64_t shared_page_key(const LogicalKVPageStore& store, LogicalKVPageHandle page,
+                              runtime::ContextResourceClass resource) {
+    return (static_cast<std::uint64_t>(resource == runtime::ContextResourceClass::MainKV) << 32U) |
+           store.descriptor_index(page);
+}
 
 } // namespace
 
@@ -105,6 +113,23 @@ ColdUsage ProgramImpl::cold_usage() const {
     return out;
 }
 
+std::unordered_map<std::uint64_t, std::uint32_t>
+ProgramImpl::victim_page_holders(std::span<const CheckpointHandle> handles) const {
+    std::unordered_map<std::uint64_t, std::uint32_t> holders;
+    for (const auto handle : handles) {
+        if (!valid_checkpoint(handle)) { continue; }
+        ObjectSet once;
+        visit_checkpoint_objects(
+            checkpoint(handle), [&](StateImageHandle) {},
+            [&](const LogicalKVPageStore& pages, LogicalKVPageHandle page,
+                runtime::ContextResourceClass resource) {
+                if (!once.insert_page(pages, page, resource)) { return; }
+                ++holders[shared_page_key(pages, page, resource)];
+            });
+    }
+    return holders;
+}
+
 ColdQuote ProgramImpl::cold_quote(std::span<const CheckpointHandle> handles) const {
     ColdQuote out;
     out.whole = true;
@@ -122,6 +147,7 @@ ColdQuote ProgramImpl::cold_quote(std::span<const CheckpointHandle> handles) con
     // Objects that become cold-only (no Device replica) when their Host replica is released.
     std::uint64_t new_cold_states = 0, new_cold_main = 0, new_cold_backend = 0;
     const auto image = state_images->host_layout().image_bytes;
+    auto victim_holders = victim_page_holders(handles);
     for (const auto handle : handles) {
         if (!valid_checkpoint(handle)) {
             block(ColdDemotionBlock::Lost);
@@ -205,6 +231,9 @@ ColdQuote ProgramImpl::cold_quote(std::span<const CheckpointHandle> handles) con
                     } else if (pages.cold_busy(page) || pages.source_pins(page) != 0) {
                         note(pages.cold_busy(page) ? ColdDemotionBlock::Busy
                                                    : ColdDemotionBlock::Unreleasable);
+                    } else if (pages.address_references(page) >
+                               victim_holders[shared_page_key(pages, page, resource)]) {
+                        // Another holder still uses this page: it stays in Host with its copy.
                     } else if (first) {
                         releasable += stride;
                         if (!pages.device_resident(page)) {
@@ -601,6 +630,10 @@ bool ProgramImpl::cancel_cold(ColdJobId id) {
 std::size_t ProgramImpl::release_cold_host(std::span<const CheckpointHandle> handles) {
     if (!cold_store || !host_context_arena) { return 0; }
     const auto before = host_context_arena->occupied_bytes();
+    // A page some other holder (a checkpoint outside the batch or a running request) still
+    // references keeps its Host replica: releasing it would make that holder read it back from
+    // the SSD.
+    auto victim_holders = victim_page_holders(handles);
     for (const auto handle : handles) {
         if (!valid_checkpoint(handle)) { continue; }
         // A checkpoint is demoted whole or not at all: every object it holds in Host needs a
@@ -637,6 +670,11 @@ std::size_t ProgramImpl::release_cold_host(std::span<const CheckpointHandle> han
                 if (!pages.cold_replica_current(page) ||
                     !host_kv_extents->can_release_page_replica(pages, page)) {
                     whole = false;
+                    return;
+                }
+                // A page another holder still uses stays in Host (with its SSD copy).
+                if (pages.address_references(page) >
+                    victim_holders[shared_page_key(pages, page, resource)]) {
                     return;
                 }
                 if (!pages.device_resident(page)) {

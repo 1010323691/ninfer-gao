@@ -794,7 +794,6 @@ private:
         page.occupied           = false;
         page.pending_device_replica.reset();
         page.host_replica.reset();
-        page.occupied = false;
         sync_cold_only(page);
         if (++page.generation == 0) { ++page.generation; }
         free_[free_count_++] = handle.index_;

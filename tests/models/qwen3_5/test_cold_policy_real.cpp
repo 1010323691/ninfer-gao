@@ -35,6 +35,14 @@ struct Policy {
     std::uint32_t window_seconds = 600;
     std::uint32_t watermark      = 0;
     std::uint64_t cold_capacity  = 8ULL << 30U;
+    // 0 selects the small capacity that forces every further history off Host.
+    std::uint64_t host_capacity = 0;
+};
+
+struct Outcome {
+    ninfer::RuntimeStats stats;
+    std::uint64_t last_round_expired = 0;
+    std::uint64_t last_round_spills  = 0;
 };
 
 ninfer::EngineOptions options(const char* artifact, const std::filesystem::path& cold,
@@ -50,7 +58,8 @@ ninfer::EngineOptions options(const char* artifact, const std::filesystem::path&
     out.kv_cache                         = ninfer::KvCacheStorage::Fp8E4M3Row256;
     out.context_cache.device_state_slots = 1;
     // About two StateImages: every further history must leave Host for the SSD or be erased.
-    out.context_cache.host_capacity_bytes = 2ULL * 153954304 + (64ULL << 20U);
+    out.context_cache.host_capacity_bytes =
+        policy.host_capacity ? policy.host_capacity : 2ULL * 153954304 + (64ULL << 20U);
     if (!cold.empty()) {
         out.context_cache.cold_directory                 = cold;
         out.context_cache.cold_capacity_bytes            = policy.cold_capacity;
@@ -138,7 +147,7 @@ std::vector<ninfer::TokenId> turn(std::uint32_t family, std::uint32_t round) {
 
 // Runs `rounds` rounds over `families` histories on an Engine with `policy`; every generated
 // sequence must equal the full-prefill reference. Returns the final statistics.
-ninfer::RuntimeStats drive(const char* artifact, const std::filesystem::path& root,
+Outcome drive(const char* artifact, const std::filesystem::path& root,
                            std::string_view name, const Policy& policy, std::uint32_t families,
                            std::uint32_t rounds, std::chrono::milliseconds pause) {
     std::vector<std::vector<ninfer::TokenId>> expected;
@@ -153,9 +162,26 @@ ninfer::RuntimeStats drive(const char* artifact, const std::filesystem::path& ro
             }
         }
     }
+    // Independent control: no tier, ample Host, prefix reuse. It validates the oracle itself:
+    // reuse at chunk-aligned points must reproduce the full-prefill tokens.
+    {
+        ninfer::Engine control(options(artifact, {}, {.host_capacity = 6ULL << 30U}));
+        std::size_t at = 0;
+        for (std::uint32_t round = 0; round < rounds; ++round) {
+            for (std::uint32_t family = 1; family <= families; ++family, ++at) {
+                const auto result =
+                    control.generate(control.prepare_tokens(turn(family, round)), request(true));
+                require(result.generated_token_ids == expected[at],
+                        "the reuse control differs from the full-prefill reference (round " +
+                            std::to_string(round) + ", history " + std::to_string(family) + ")");
+            }
+        }
+    }
     ninfer::Engine engine(options(artifact, fresh_directory(root, name), policy));
+    Outcome outcome;
     std::size_t index = 0;
     for (std::uint32_t round = 0; round < rounds; ++round) {
+        const auto before = engine.runtime_stats();
         for (std::uint32_t family = 1; family <= families; ++family, ++index) {
             const auto result =
                 engine.generate(engine.prepare_tokens(turn(family, round)), request(true));
@@ -164,11 +190,15 @@ ninfer::RuntimeStats drive(const char* artifact, const std::filesystem::path& ro
                         ", history " + std::to_string(family) + ")");
         }
         wait_idle(engine);
-        print_cold("round " + std::to_string(round), engine.runtime_stats());
+        const auto after = engine.runtime_stats();
+        outcome.last_round_expired = after.cold_expired_erasures - before.cold_expired_erasures;
+        outcome.last_round_spills  = after.cold_spills_completed - before.cold_spills_completed;
+        print_cold("round " + std::to_string(round), after);
         if (pause.count()) { std::this_thread::sleep_for(pause); }
     }
     wait_idle(engine);
-    return engine.runtime_stats();
+    outcome.stats = engine.runtime_stats();
+    return outcome;
 }
 
 // Histories inside the window are written; when the SSD is full its oldest content is evicted.
@@ -176,7 +206,8 @@ void full_ssd_evicts_the_oldest(const char* artifact, const std::filesystem::pat
     const auto stats = drive(artifact, root, "policy-evict",
                              {.window_seconds = 600, .watermark = 0,
                               .cold_capacity = 700ULL << 20U},
-                             12, 3, std::chrono::milliseconds(0));
+                             12, 3, std::chrono::milliseconds(0))
+                           .stats;
     print_cold("eviction", stats);
     require(stats.cold_spills_completed >= 1, "nothing was written to the SSD");
     require(stats.cold_restores_completed >= 1, "no history was restored from the SSD");
@@ -186,12 +217,15 @@ void full_ssd_evicts_the_oldest(const char* artifact, const std::filesystem::pat
 
 // Content idle past the window is erased on demand, never written.
 void expired_content_is_erased(const char* artifact, const std::filesystem::path& root) {
-    const auto stats = drive(artifact, root, "policy-age",
-                             {.window_seconds = 2, .watermark = 0}, 6, 3,
-                             std::chrono::milliseconds(2600));
-    print_cold("age rule", stats);
-    require(stats.cold_expired_erasures >= 1,
+    const auto outcome = drive(artifact, root, "policy-age",
+                               {.window_seconds = 2, .watermark = 0}, 6, 3,
+                               std::chrono::milliseconds(2600));
+    print_cold("age rule", outcome.stats);
+    require(outcome.stats.cold_expired_erasures >= 1,
             "no content past the demote window was erased on demand");
+    // After each pause everything older is expired, so the last round erases instead of writing.
+    require(outcome.last_round_expired > outcome.last_round_spills,
+            "expired content was written instead of erased in the last round");
 }
 
 // Below the Host watermark the next victims are written ahead without releasing Host; a
@@ -214,10 +248,16 @@ void watermark_prewrites(const char* artifact, const std::filesystem::path& root
     }
     wait_idle(engine);
     print_cold("after pressure", engine.runtime_stats());
+    require(engine.runtime_stats().cold_only_states >= 1,
+            "pressure never released a pre-written history from Host");
+    const auto before = engine.runtime_stats().cold_restores_completed;
     const auto result =
         engine.generate(engine.prepare_tokens(continuation(1)), request(true));
     require(result.generated_token_ids == expected,
             "a pre-written history changed the greedy tokens");
+    wait_idle(engine);
+    require(engine.runtime_stats().cold_restores_completed > before,
+            "the history was recomputed instead of restored from its pre-written copy");
     wait_idle(engine);
 }
 
