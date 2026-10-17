@@ -1,8 +1,10 @@
 #pragma once
 
+#include "core/cold_context_store.h"
 #include "models/qwen3_5/state/state_image.h"
 
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -51,6 +53,13 @@ enum class StateTransferDirection : std::uint8_t {
     DeviceToHost,
     HostToDevice,
     HostToFork,
+};
+
+// SSD copy of one immutable StateImage, valid for the content epoch it was written from.
+struct ColdStateReplica {
+    ColdSlot slot;
+    std::uint64_t content_epoch = 0;
+    std::uint32_t checksum      = 0;
 };
 
 struct StateImageSelectors {
@@ -120,6 +129,11 @@ public:
     StateImageStore& operator=(const StateImageStore&) = delete;
     StateImageStore(StateImageStore&&)                 = delete;
     StateImageStore& operator=(StateImageStore&&)      = delete;
+
+    void attach_cold_store(ColdContextStore* store, std::uint32_t cold_only_limit) noexcept {
+        cold_            = store;
+        cold_only_limit_ = store ? cold_only_limit : 0;
+    }
 
     [[nodiscard]] std::uint32_t capacity() const noexcept {
         return static_cast<std::uint32_t>(objects_.size());
@@ -263,13 +277,172 @@ public:
         return *object.device_slot;
     }
 
+    [[nodiscard]] bool cold_replica_current(StateImageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Object& object = objects_[handle.index_];
+        return object.role == StateImageRole::CheckpointImmutable && object.cold_replica &&
+               object.cold_replica->content_epoch == object.content_epoch;
+    }
+
+    [[nodiscard]] const ColdStateReplica* cold_replica(StateImageHandle handle) const {
+        const Object& object = require(handle);
+        return object.cold_replica ? &*object.cold_replica : nullptr;
+    }
+
+    [[nodiscard]] bool cold_busy(StateImageHandle handle) const {
+        return require(handle).cold_busy;
+    }
+
+    [[nodiscard]] bool cold_only(StateImageHandle handle) const {
+        const Object& object = require(handle);
+        return !object.device_slot && !object.host_slot && object.cold_replica.has_value();
+    }
+
+    [[nodiscard]] bool has_replica(StateImageHandle handle) const {
+        const Object& object = require(handle);
+        return object.device_slot || object.host_slot || object.cold_replica;
+    }
+
+    [[nodiscard]] std::uint32_t cold_only_states() const noexcept { return cold_only_count_; }
+
+    [[nodiscard]] std::uint32_t cold_only_limit() const noexcept { return cold_only_limit_; }
+
+    [[nodiscard]] bool can_spill(StateImageHandle handle) const noexcept {
+        if (!valid(handle) || cold_ == nullptr || host_ == nullptr) { return false; }
+        const Object& object = objects_[handle.index_];
+        return object.role == StateImageRole::CheckpointImmutable && object.host_slot &&
+               !object.cold_busy && !object.cold_replica && !object.pending_host_slot;
+    }
+
+    [[nodiscard]] HostStateImageConstView host_view(StateImageHandle handle) const {
+        const Object& object = require(handle);
+        if (host_ == nullptr || !object.host_slot) {
+            throw std::logic_error("StateImage has no published Host replica");
+        }
+        return host_->view(*object.host_slot);
+    }
+
+    void set_cold_busy(StateImageHandle handle, bool busy) {
+        Object& object = require(handle);
+        if (object.cold_busy == busy) {
+            throw std::logic_error("StateImage cold pin is unbalanced");
+        }
+        object.cold_busy = busy;
+        if (!busy) { retire_released_owner(handle); }
+    }
+
+    void attach_cold_replica(StateImageHandle handle, ColdStateReplica replica) {
+        Object& object = require(handle);
+        if (cold_ == nullptr || object.cold_replica || !replica.slot.valid() ||
+            object.role != StateImageRole::CheckpointImmutable ||
+            replica.content_epoch != object.content_epoch) {
+            throw std::logic_error("StateImage cold replica is not publishable");
+        }
+        object.cold_replica = replica;
+        sync_cold_only(object);
+    }
+
+    // Releases a redundant SSD copy; a cold-only image keeps its last replica.
+    [[nodiscard]] bool drop_cold_replica(StateImageHandle handle) {
+        if (!valid(handle)) { return false; }
+        Object& object = objects_[handle.index_];
+        if (!object.cold_replica || object.cold_busy ||
+            (!object.device_slot && !object.host_slot)) {
+            return false;
+        }
+        release_cold(object);
+        return true;
+    }
+
+    void invalidate_cold_replica(StateImageHandle handle) {
+        Object& object = require(handle);
+        if (object.cold_busy) {
+            throw std::logic_error("busy cold StateImage cannot be invalidated");
+        }
+        release_cold(object);
+    }
+
+    // Releases the Host replica when a current SSD copy keeps the immutable content.
+    [[nodiscard]] bool can_drop_host_to_cold(StateImageHandle handle) const noexcept {
+        if (!valid(handle) || host_ == nullptr) { return false; }
+        const Object& object = objects_[handle.index_];
+        return object.host_slot && !object.cold_busy && cold_replica_current(handle) &&
+               object.source_pins == 0 && !object.destination_pinned &&
+               !has_pending_replica(object) &&
+               (object.device_slot || cold_only_count_ < cold_only_limit_);
+    }
+
+    // Whether nothing but a missing current SSD copy keeps the Host replica from being released
+    // (the cold-only limit is the caller's aggregate check).
+    [[nodiscard]] bool host_releasable_after_spill(StateImageHandle handle) const noexcept {
+        if (!valid(handle) || host_ == nullptr) { return false; }
+        const Object& object = objects_[handle.index_];
+        return object.host_slot && !object.cold_busy && object.source_pins == 0 &&
+               !object.destination_pinned && !has_pending_replica(object);
+    }
+
+    [[nodiscard]] bool drop_host_to_cold(StateImageHandle handle) noexcept {
+        if (!can_drop_host_to_cold(handle)) { return false; }
+        Object& object = objects_[handle.index_];
+        if (!host_->release(*object.host_slot)) { return false; }
+        object.host_slot.reset();
+        sync_cold_only(object);
+        return true;
+    }
+
+    // Reserves a hidden Host destination for a cold-only image. The pending slot keeps every
+    // other transition (bind, fork, Move, release) closed until publish or abort.
+    [[nodiscard]] bool reserve_cold_restore(StateImageHandle handle) noexcept {
+        if (!valid(handle) || host_ == nullptr) { return false; }
+        Object& object = objects_[handle.index_];
+        if (object.device_slot || object.host_slot || !cold_replica_current(handle) ||
+            object.cold_busy || has_pending_replica(object) || object.destination_pinned) {
+            return false;
+        }
+        const auto target = host_->allocate();
+        if (!target) { return false; }
+        object.pending_host_slot  = *target;
+        object.destination_pinned = true;
+        return true;
+    }
+
+    [[nodiscard]] HostStateImageView cold_restore_view(StateImageHandle handle) {
+        Object& object = require(handle);
+        if (host_ == nullptr || !object.pending_host_slot || object.host_slot) {
+            throw std::logic_error("StateImage has no cold restore destination");
+        }
+        return host_->writable_view(*object.pending_host_slot);
+    }
+
+    void publish_cold_restore(StateImageHandle handle) {
+        Object& object = require(handle);
+        if (host_ == nullptr || !object.pending_host_slot || object.host_slot ||
+            !cold_replica_current(handle) || !host_->publish(*object.pending_host_slot)) {
+            throw std::logic_error("StateImage cold restore is not publishable");
+        }
+        object.host_slot = object.pending_host_slot;
+        object.pending_host_slot.reset();
+        object.destination_pinned = false;
+        sync_cold_only(object);
+    }
+
+    void abort_cold_restore(StateImageHandle handle) noexcept {
+        if (!valid(handle)) { return; }
+        Object& object = objects_[handle.index_];
+        if (!object.pending_host_slot || object.host_slot) { return; }
+        if (host_ != nullptr) { (void)host_->release(*object.pending_host_slot); }
+        object.pending_host_slot.reset();
+        object.destination_pinned = false;
+    }
+
     void move_checkpoint_to_active(StateImageHandle handle) {
         Object& object = require(handle);
         if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||
             object.checkpoint_references != 0 || object.source_pins != 0 ||
-            object.destination_pinned || has_pending_replica(object)) {
+            object.destination_pinned || has_pending_replica(object) || object.cold_busy) {
             throw std::logic_error("StateImage checkpoint is not movable");
         }
+        release_cold(object);
         if (object.host_slot) {
             if (host_ == nullptr || !host_->release(*object.host_slot)) {
                 throw std::logic_error("StateImage Host replica could not be consumed by Move");
@@ -297,7 +470,7 @@ public:
         Object& object = objects_[handle.index_];
         if (host_ == nullptr || object.role != StateImageRole::CheckpointImmutable ||
             !object.device_slot || !object.host_slot || object.source_pins != 0 ||
-            object.destination_pinned || has_pending_replica(object) ||
+            object.destination_pinned || has_pending_replica(object) || object.cold_busy ||
             !host_->release(*object.host_slot)) {
             return false;
         }
@@ -343,6 +516,8 @@ public:
             object.destination_pinned || has_pending_replica(object)) {
             throw std::logic_error("StateImage checkpoint is not thawable");
         }
+        if (object.cold_busy) { throw std::logic_error("StateImage checkpoint is being spilled"); }
+        release_cold(object);
         object.role = StateImageRole::ActiveMutable;
     }
 
@@ -622,6 +797,7 @@ public:
             return_device_slot(*object.device_slot);
             object.device_slot.reset();
         }
+        release_cold(object);
         object.role          = StateImageRole::Free;
         object.content_epoch = 0;
         if (++object.generation == 0) { ++object.generation; }
@@ -633,7 +809,7 @@ public:
         if (!valid(handle)) { return false; }
         const Object& object = objects_[handle.index_];
         return object.checkpoint_references == 0 && object.source_pins == 0 &&
-               !object.destination_pinned && !has_pending_replica(object);
+               !object.destination_pinned && !has_pending_replica(object) && !object.cold_busy;
     }
 
     [[nodiscard]] bool
@@ -642,7 +818,8 @@ public:
         const Object& object = require(handle);
         if (released_references > object.checkpoint_references) { return false; }
         if (object.checkpoint_references != released_references) { return true; }
-        if (object.source_pins != 0 || object.destination_pinned || has_pending_replica(object)) {
+        if (object.source_pins != 0 || object.destination_pinned || has_pending_replica(object) ||
+            object.cold_busy) {
             return false;
         }
         if (object.host_slot) {
@@ -666,7 +843,32 @@ private:
         bool destination_pinned             = false;
         bool release_pending                = false;
         StateImageRole role                 = StateImageRole::Free;
+        std::optional<ColdStateReplica> cold_replica;
+        bool cold_busy         = false;
+        bool counted_cold_only = false;
     };
+
+    void sync_cold_only(Object& object) noexcept {
+        const bool now = object.role != StateImageRole::Free && !object.device_slot &&
+                         !object.host_slot && object.cold_replica.has_value();
+        if (now == object.counted_cold_only) { return; }
+        object.counted_cold_only = now;
+        if (now) {
+            ++cold_only_count_;
+        } else {
+            --cold_only_count_;
+        }
+    }
+
+    void release_cold(Object& object) noexcept {
+        if (!object.cold_replica) { return; }
+        if (object.cold_busy || cold_ == nullptr) { std::terminate(); }
+        try {
+            cold_->release(object.cold_replica->slot);
+        } catch (...) { std::terminate(); }
+        object.cold_replica.reset();
+        sync_cold_only(object);
+    }
 
     void retire_released_owner(StateImageHandle handle) noexcept {
         if (valid(handle) && objects_[handle.index_].release_pending && can_release(handle) &&
@@ -751,6 +953,9 @@ private:
     std::uint32_t free_device_count_  = 0;
     std::uint64_t next_content_epoch_ = 0;
     std::uint64_t next_transfer_id_   = 0;
+    ColdContextStore* cold_           = nullptr;
+    std::uint32_t cold_only_limit_    = 0;
+    std::uint32_t cold_only_count_    = 0;
 };
 
 inline StateImageTransfer::~StateImageTransfer() {

@@ -244,7 +244,8 @@ CheckpointSummary ProgramImpl::checkpoint_summary(CheckpointHandle handle) const
         for (std::uint32_t index = 0; index < kv_pages_for_frontier(frontier); ++index) {
             const auto page = addresses.logical_page(address, index);
             if (unpinned && page_evictable(pages, page)) { ++evictable; }
-            if (releasable && pages.host_resident(page) && pages.source_pins(page) == 0) {
+            if (releasable && pages.host_resident(page) && pages.source_pins(page) == 0 &&
+                !pages.cold_busy(page)) {
                 out.evictable_resources.host_bytes +=
                     (&pages == text_kv_pages.get() ? text_host_kv_page_stride
                                                    : backend_host_kv_page_stride);
@@ -342,7 +343,8 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
             if (pages.source_pins(entry.page) || pages.active_address_references(entry.page)) {
                 return false;
             }
-            if (pages.host_resident(entry.page)) {
+            // A Host source under an SSD write is released only after that write completes.
+            if (pages.host_resident(entry.page) && !pages.cold_busy(entry.page)) {
                 bytes += (&pages == text_kv_pages.get() ? text_host_kv_page_stride
                                                         : backend_host_kv_page_stride);
             }

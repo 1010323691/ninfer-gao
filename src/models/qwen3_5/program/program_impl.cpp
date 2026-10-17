@@ -103,8 +103,19 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         }
         return static_cast<std::uint32_t>(value);
     };
+    // Cold-only objects keep logical descriptors without Device or Host bytes. Their number is
+    // bounded per class by what the configured SSD capacity can hold; the stores enforce it.
+    const auto& cold_options   = plan.context_cache;
+    const bool cold_tier       = !cold_options.cold_directory.empty();
+    const auto cold_round      = [](std::uint64_t bytes) { return (bytes + 4095) / 4096 * 4096; };
+    const auto cold_states     = cold_tier ? cold_options.cold_capacity_bytes /
+                                             cold_round(state_images->host_layout().image_bytes)
+                                           : 0;
+    const auto cold_main_pages =
+        cold_tier ? cold_options.cold_capacity_bytes / cold_round(text_host_kv_page_stride) : 0;
     const auto logical_states = checked_count(state_images->slot_count() +
-                                              host_bytes / state_images->host_layout().image_bytes);
+                                              host_bytes / state_images->host_layout().image_bytes +
+                                              cold_states);
     // One immutable image can serve private replay, an explicit anchor, a public view and an
     // exact-hit endpoint. Alias descriptors are bounded separately from physical state slots.
     checkpoints.resize(checked_count(4ULL * logical_states + 2ULL * max_concurrency));
@@ -126,7 +137,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         std::make_unique<StateImageStore>(*state_images, host_state_images.get(), logical_states);
     const auto logical_pages = [&](const DeviceKVPagePool& pool) {
         const auto stride = plan_host_kv_page_layout(pool.geometry()).page_stride;
-        return checked_count(pool.capacity_pages() + host_bytes / stride);
+        // Backend pages track Main token coverage, so the Main page count bounds both pools.
+        return checked_count(pool.capacity_pages() + host_bytes / stride + cold_main_pages);
     };
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
         decoder->text_kv.page_pool(), logical_pages(decoder->text_kv.page_pool()));
@@ -139,6 +151,26 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
             *backend_kv_pages, backend->execution_tables(), address_capacity,
             backend->execution_tables().logical_page_capacity());
+    }
+    if (cold_tier) {
+        if (!host_context_arena) {
+            throw std::invalid_argument("the SSD context tier requires Host context capacity");
+        }
+        ColdStoreOptions cold;
+        cold.directory      = cold_options.cold_directory;
+        cold.capacity_bytes = cold_options.cold_capacity_bytes;
+        cold.object_bytes[static_cast<std::size_t>(ColdObjectClass::MainKVPage)] =
+            text_host_kv_page_stride;
+        cold.object_bytes[static_cast<std::size_t>(ColdObjectClass::BackendKVPage)] =
+            backend_host_kv_page_stride;
+        cold.object_bytes[static_cast<std::size_t>(ColdObjectClass::StateImage)] =
+            state_images->host_layout().image_bytes;
+        cold_store = std::make_unique<ColdContextStore>(std::move(cold));
+        state_store->attach_cold_store(cold_store.get(), checked_count(cold_states));
+        text_kv_pages->attach_cold_store(cold_store.get(), checked_count(cold_main_pages));
+        if (backend_kv_pages) {
+            backend_kv_pages->attach_cold_store(cold_store.get(), checked_count(cold_main_pages));
+        }
     }
 
     io = qwen3_5::RoundState(backing, plan.persistent.round);
@@ -231,6 +263,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
+    shutdown_cold();
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }

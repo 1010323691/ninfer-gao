@@ -412,6 +412,9 @@ int main() {
                                .paused_ns            = 123456789012345ULL,
                                .device_to_host_bytes = 3145728,
                                .host_to_device_bytes = 2097152,
+                               .cold_restores        = 1,
+                               .cold_to_host_bytes   = 197000000ULL,
+                               .cold_restore_wait_ns = 41000000,
     };
     outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
@@ -431,7 +434,10 @@ int main() {
                                                                  {"replayed_tokens", 640},
                                                                  {"paused_ns", 123456789012345ULL},
                                                                  {"device_to_host_bytes", 3145728},
-                                                                 {"host_to_device_bytes", 2097152}},
+                                                                 {"host_to_device_bytes", 2097152},
+                                                                 {"cold_restores", 1},
+                                                                 {"cold_to_host_bytes", 197000000ULL},
+                                                                 {"cold_restore_wait_ns", 41000000}},
               "per-request scheduling observations or Engine request ID missing");
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");
@@ -726,6 +732,12 @@ int main() {
     throughput.current.host_context_peak_occupied_bytes = 20ULL << 20;
     throughput.current.last_selected_frontier_tokens    = 64;
     throughput.current.pressure_spill_pages             = 4;
+    throughput.previous.cold_write_bytes                = 1000;
+    throughput.current.cold_enabled                     = true;
+    throughput.current.cold_write_bytes                 = 5000;
+    throughput.current.cold_write_bytes_24h             = 4500;
+    throughput.current.cold_only_states                 = 2;
+    throughput.current.cold_restores_completed          = 3;
     throughput.current.host_work                        = {
                                .engine_boundary_ns            = 1000000,
                                .program_submit_ns             = 2000000,
@@ -782,6 +794,15 @@ int main() {
             tail_json.at("context_cache").at("occupancy").at("host_context_peak_occupied_bytes") ==
                 (20ULL << 20),
         "shutdown interval or allocator high-water mark was lost");
+    const Json& cold = throughput_json.at("context_cache").at("cold");
+    failures += check(cold.at("write_bytes") == 4000 && cold.at("write_bytes_total") == 5000 &&
+                          cold.at("write_bytes_24h") == 4500 && cold.at("cold_only_states") == 2 &&
+                          cold.at("restores_completed") == 3 && !cold.at("disabled").get<bool>(),
+                      "SSD tier throughput fields mismatch");
+    failures += check(!Json::parse(format_throughput_json("serve-test", 5000, single_decode))
+                           .at("context_cache")
+                           .contains("cold"),
+                      "SSD tier fields reported without a configured tier");
     failures += check(throughput_json.at("tokens").at("computed_prefill") == 100 &&
                           throughput_json.at("tokens").at("committed_decode") == 40,
                       "throughput token deltas mismatch");

@@ -75,6 +75,12 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
                             (resume && checkpoint(*source).frontier > resume->frontier()))))) {
         return {.source_valid = false};
     }
+    if (source) {
+        // Binding never reads the SSD: Runtime restores cold-only content to Host first.
+        const auto residency = cold_residency(*source);
+        if (residency == ColdResidency::Lost) { return {.source_valid = false}; }
+        if (residency == ColdResidency::ColdOnly) { return {.cold_restore = true}; }
+    }
     ContextTransaction transaction;
     transaction.kind               = ContextOperationKind::Bind;
     transaction.lane               = lane;
@@ -121,11 +127,13 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
         transaction.borrow_state =
             checkpoints[source->index].pins == 0 &&
             state_store->checkpoint_references(checkpoint(*source).state) == 1 &&
-            state_store->source_pins(checkpoint(*source).state) == 0;
+            state_store->source_pins(checkpoint(*source).state) == 0 &&
+            !state_store->cold_busy(checkpoint(*source).state);
         transaction.split_state = !transaction.borrow_state &&
                                   state_store->device_resident(checkpoint(*source).state) &&
                                   state_store->host_resident(checkpoint(*source).state) &&
                                   state_store->source_pins(checkpoint(*source).state) == 0 &&
+                                  !state_store->cold_busy(checkpoint(*source).state) &&
                                   state_store->device_occupied() == state_store->device_capacity();
         const auto& record = checkpoint(*source);
         const auto movable = [&](const KVAddressSpaceStore& addresses,

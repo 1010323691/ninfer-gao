@@ -323,8 +323,8 @@ std::uint64_t ContextMachineCostModel::transfer_ns(ContextTransferDirection dire
                                                    TransferWork work) const noexcept {
     if (work.payload_bytes == 0 && work.copy_operations == 0) { return 0; }
     const std::size_t index = direction_index(direction);
-    if (index >= transfer.size()) { return std::numeric_limits<std::uint64_t>::max(); }
-    const ContextTransferCost& cost = transfer[index];
+    if (index > transfer.size()) { return std::numeric_limits<std::uint64_t>::max(); }
+    const ContextTransferCost& cost = index == transfer.size() ? cold_read : transfer[index];
     const std::uint64_t operation_limited =
         saturating_add(cost.batch_ns, saturating_product(cost.operation_ns, work.copy_operations));
     const std::uint64_t bandwidth_limited =
@@ -343,10 +343,23 @@ std::uint64_t ContextMachineCostModel::prefill_ns(PrefillWork work) const noexce
     return result;
 }
 
+ContextTransferCost cold_read_transfer_cost(double read_bytes_per_second) noexcept {
+    ContextTransferCost cost{.batch_ns = 200'000};
+    if (!(read_bytes_per_second > 0.0)) {
+        cost.ns_per_byte_q32 = std::numeric_limits<std::uint64_t>::max();
+        return cost;
+    }
+    const double q32 = 1.0e9 / read_bytes_per_second * static_cast<double>(kContextCostQ32One);
+    cost.ns_per_byte_q32 =
+        q32 >= 1.8e19 ? std::numeric_limits<std::uint64_t>::max()
+                      : std::max<std::uint64_t>(1, static_cast<std::uint64_t>(q32));
+    return cost;
+}
+
 std::uint64_t price_context_transfer_requirements(
     const ContextMachineCostModel& model,
     std::span<const ContextTransferRequirement> requirements) noexcept {
-    std::array<TransferWork, 3> coalesced{};
+    std::array<TransferWork, 4> coalesced{};
     for (const ContextTransferRequirement& requirement : requirements) {
         const std::size_t index = direction_index(requirement.direction);
         if (index >= coalesced.size()) { return std::numeric_limits<std::uint64_t>::max(); }
@@ -363,6 +376,7 @@ std::uint64_t price_context_transfer_requirements(
         ContextTransferDirection::DeviceToHost,
         ContextTransferDirection::HostToDevice,
         ContextTransferDirection::DeviceToDevice,
+        ContextTransferDirection::ColdToHost,
     };
     std::uint64_t total = 0;
     for (std::size_t index = 0; index < coalesced.size(); ++index) {

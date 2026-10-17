@@ -100,7 +100,13 @@ public:
         std::optional<HostKVAllocation> allocation =
             arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
         if (!allocation) { return std::nullopt; }
+        return reserve_membership(pages, membership, std::move(*allocation));
+    }
 
+private:
+    [[nodiscard]] HostKVExtentReservation
+    reserve_membership(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership,
+                       HostKVAllocation allocation) {
         const std::uint32_t descriptor = free_[--free_count_];
         Extent& extent                 = extents_[descriptor];
         if (extent.state != ExtentState::Free) { std::terminate(); }
@@ -133,6 +139,29 @@ public:
         reservation.generation_ = extent.generation;
         reservation.page_store_ = &pages;
         return reservation;
+    }
+
+public:
+    // Host destination for cold-only pages read back from the SSD tier. Pages stay source-pinned
+    // and invisible until publish(); abort() leaves them cold-only.
+    [[nodiscard]] std::optional<HostKVExtentReservation>
+    prepare_cold_restore(LogicalKVPageStore& pages,
+                         std::span<const LogicalKVPageHandle> membership) {
+        if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
+            return std::nullopt;
+        }
+        for (const LogicalKVPageHandle page : membership) {
+            if (!pages.valid(page) || !pages.cold_only(page) || !pages.cold_replica_current(page) ||
+                pages.cold_busy(page) ||
+                pages.source_pins(page) == std::numeric_limits<std::uint32_t>::max()) {
+                return std::nullopt;
+            }
+        }
+        const HostKVPageLayout& layout = page_layout(pages);
+        std::optional<HostKVAllocation> allocation =
+            arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
+        if (!allocation) { return std::nullopt; }
+        return reserve_membership(pages, membership, std::move(*allocation));
     }
 
     [[nodiscard]] HostKVAllocationView writable_view(HostKVExtentReservation& reservation) {
@@ -253,9 +282,7 @@ public:
             if (!extent.page_store->valid(page) || !extent.page_store->host_resident(page) ||
                 replica.extent != capability || replica.page_offset != index ||
                 replica.membership_node != node || membership.extent != capability.index_ ||
-                membership.offset != index ||
-                (!extent.page_store->device_resident(page) &&
-                 extent.page_store->address_references(page) != 0)) {
+                membership.offset != index || !extent.page_store->host_release_preserves(page)) {
                 return false;
             }
             node = memberships_[node].next;
@@ -274,7 +301,7 @@ public:
     [[nodiscard]] bool can_release_page_replica(LogicalKVPageStore& pages,
                                                 LogicalKVPageHandle page) const noexcept {
         if (!pages.valid(page) || !pages.host_resident(page) || pages.source_pins(page) != 0 ||
-            (!pages.device_resident(page) && pages.address_references(page) != 0)) {
+            !pages.host_release_preserves(page)) {
             return false;
         }
         const HostKVPageReplica replica = pages.host_replica(page);
@@ -342,7 +369,8 @@ public:
                 const std::size_t bytes =
                     partition_extent(index, [](const LogicalKVPageStore& pages,
                                                LogicalKVPageHandle page, std::uint32_t) {
-                        return pages.address_references(page) == 0 && pages.source_pins(page) == 0;
+                        return pages.address_references(page) == 0 &&
+                               pages.source_pins(page) == 0 && !pages.cold_busy(page);
                     });
                 if (bytes > std::numeric_limits<std::size_t>::max() - released_bytes) {
                     std::terminate();
@@ -504,8 +532,7 @@ private:
             }
             const bool release = should_release(*pages, entry.page, node);
             if (release && (pages->source_pins(entry.page) != 0 ||
-                            (!pages->device_resident(entry.page) &&
-                             pages->address_references(entry.page) != 0))) {
+                            !pages->host_release_preserves(entry.page))) {
                 throw std::logic_error("Host KV partition contains an unreleasable page");
             }
             if (partition_runs_.empty() || partition_runs_.back().release != release) {

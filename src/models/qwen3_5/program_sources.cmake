@@ -26,6 +26,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/context_transaction.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/binding.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/capture.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/transactions/cold.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/commit.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/pause.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/reclaim.cpp"

@@ -31,6 +31,18 @@ ninfer_add_test(ninfer_qwen3_5_native_transactions_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_native_transactions.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
 
+ninfer_add_test(ninfer_qwen3_5_cold_tier_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_cold_tier.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
+
+ninfer_add_test(ninfer_qwen3_5_cold_engine_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_cold_engine_real.cpp"
+  LIBRARIES ninfer_engine)
+
+ninfer_add_test(ninfer_qwen3_5_cold_policy_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_cold_policy_real.cpp"
+  LIBRARIES ninfer_engine)
+
 ninfer_add_test(ninfer_qwen3_5_prefix_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_prefix_real.cpp"
   LIBRARIES ninfer_engine)
@@ -88,6 +100,9 @@ set_tests_properties(ninfer_qwen3_5_agent_continuation_real_test PROPERTIES
 set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_loading_real_test
   ninfer_qwen3_5_native_transactions_test
+  ninfer_qwen3_5_cold_tier_test
+  ninfer_qwen3_5_cold_engine_real_test
+  ninfer_qwen3_5_cold_policy_real_test
   ninfer_qwen3_5_prefix_real_test
   ninfer_qwen3_5_agent_continuation_real_test
   ninfer_qwen3_5_preemption_real_test

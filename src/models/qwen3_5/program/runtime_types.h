@@ -28,5 +28,10 @@ struct RuntimeTypes {
     using AbortResult       = qwen3_5::AbortResult;
     using Program           = qwen3_5::Program;
     using CacheSessionKey   = qwen3_5::PreparedSessionKey;
+    using ColdJobId         = qwen3_5::ColdJobId;
+    using ColdJobKind       = qwen3_5::ColdJobKind;
+    using ColdJobStatus     = qwen3_5::ColdJobStatus;
+    using ColdStartStatus   = qwen3_5::ColdStartStatus;
+    using ColdDemotionBlock = qwen3_5::ColdDemotionBlock;
 };
 } // namespace ninfer::models::qwen3_5
