@@ -752,6 +752,27 @@ void test_age_rule_hit_refreshes_demand() {
     require(f.cache.expired(history), "a history did not expire after its window");
 }
 
+// A running request keeps the history it carries in use even though it has not published.
+void test_age_rule_active_owner_is_not_idle() {
+    using namespace std::chrono_literals;
+    using Clock = Fixture::Cache::WallClock;
+    Fixture f(64);
+    auto now = Clock::time_point{} + 100000s;
+    f.cache.set_wall_clock([&now] { return now; });
+    f.cache.set_host_victim_policy(
+        {.pending = [] { return false; }, .demote_window = std::chrono::nanoseconds(600s)});
+    const auto history = f.program.add({1, 2}, {f.program.host_block(16)}, Role::Continuation);
+    const auto owner   = f.publish(history);
+    const Base next{.tokens = {1, 2, 3}};
+    const auto choice = f.source(next, history);
+    require(choice.take_over && choice.owner == owner, "fixture could not take over the owner");
+    const auto active = f.cache.adopt(f.program, choice, next, 20, {}, {&history, 1});
+    now += 1000s;
+    require(f.cache.idle_for(history) == 0s && !f.cache.expired(history),
+            "a running request's carried history was judged idle");
+    f.cache.abandon(f.program, active);
+}
+
 void test_candidates_keep_all_frontiers_and_independent_contents() {
     Fixture f(64);
     const auto shallow    = f.program.add({1, 2});
@@ -1748,6 +1769,13 @@ void test_lower_tier_quote_ranks_demotion_ahead_of_device_erasure() {
                     f.cache.reclaim_erasures() == 0,
                 "the demotion that spilled its Host victim was not counted");
         require(f.program.demoted.empty(), "the demotion started before its Host destination");
+        // While that batch is being written the demotion cannot start, and the Device erasure
+        // ranked after it must wait for the batch instead of deleting what it makes room for.
+        require(f.cache.reclaim(f.program, {.state_slots = 1}) == ReclaimProgress::Spilling &&
+                    f.program.valid_checkpoint(device) && f.program.valid_checkpoint(host) &&
+                    f.program.released.empty() && f.cache.device_release_erasures() == 0 &&
+                    f.cache.reclaim_erasures() == 0,
+                "a Device erasure ran while the batch it waits for was still being written");
     }
     {
         Fixture f(32);
@@ -2121,6 +2149,7 @@ int main() {
         test_lower_tier_quote_ranks_demotion_ahead_of_device_erasure();
         test_age_rule_takes_expired_victims_first();
         test_age_rule_hit_refreshes_demand();
+        test_age_rule_active_owner_is_not_idle();
         test_committed_repeated_demand_admits_a_new_short_working_set();
         test_cold_writeback_protects_reused_history();
         test_host_preflight_counts_aliases_and_has_no_partial_deletion();

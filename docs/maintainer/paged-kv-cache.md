@@ -410,6 +410,8 @@ table；唯一有效 source 也不能先释放。
 - 共享页是同一个 logical page，SSD replica 天然只写一份；COW 与增长得到的新页不继承它。
 - 检查点按整体降级：只有它在 Host 上的每个对象都有当前 SSD replica 时才释放这些对象的 Host replica；
   仅 Device replica 的对象（如共享前缀页）留在 Device，不参与也不阻塞。
+- 被非受害者检查点仍引用的页，在受害者降级时保留 Host replica（与 SSD replica 并存），其他持有者不会
+  因此变为仅冷；页落盘一次，之后由最后一个持有者的降级释放 Host replica。
 - SSD 传输期间页被 cold pin，Host 源或预留的 Host 目的都不能释放。
 - 读回校验失败的 SSD replica 被丢弃，即使它是最后一个 replica；覆盖该页的检查点不再可恢复。
 - 仅 SSD replica 的页数受启动时为冷层加入的描述符额度约束。

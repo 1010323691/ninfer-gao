@@ -456,6 +456,38 @@ public:
         expect_empty("shared spill leaked SSD slots or descriptors");
     }
 
+    // Demoting one holder must not take a page another holder still reads out of Host.
+    void shared_page_stays_for_other_holders() {
+        const auto source = checkpoint(tokens(128));
+        auto extension    = request(tokens(256), true);
+        const auto bound  = bind(extension, source);
+        std::optional<qwen::CheckpointHandle> made;
+        (void)generate(bound, 0, true, &made);
+        require(made.has_value(), "descendant was not retained");
+        const auto descendant = *made;
+        const std::array family{source, descendant};
+        demote_all(family);
+        const auto before = host_objects(source);
+        const std::array victim{descendant};
+        const auto started = program_.start_spill(family);
+        require(started.status == qwen::ColdStartStatus::Started, "family spill did not start");
+        (void)wait_one();
+        (void)program_.release_cold_host(victim);
+        const auto after = host_objects(source);
+        require(after.size() == before.size(),
+                "releasing a descendant took shared pages out of Host for the source");
+        for (std::size_t index = 0; index < before.size(); ++index) {
+            require(after[index].bytes == before[index].bytes,
+                    "a shared page changed while another holder was demoted");
+        }
+        require(program_.cold_residency(source) == ProgramImpl::ColdResidency::Resident,
+                "the source stopped being Host resident");
+        (void)program_.drop_cold(family);
+        require(program_.release_checkpoint(descendant) && program_.release_checkpoint(source),
+                "checkpoints were not releasable");
+        expect_empty("shared holder demotion leaked resources");
+    }
+
     // Spill in flight while the checkpoint is released: Host survives until the write retires.
     void release_during_spill() {
         const auto source = checkpoint(tokens(192));
@@ -657,6 +689,7 @@ int main(int argc, char** argv) {
             ColdFixture fixture(device, program, frontend, backend == SpeculativeBackend::Mtp);
             fixture.roundtrip();
             fixture.shared_pages();
+            fixture.shared_page_stays_for_other_holders();
             fixture.release_during_spill();
             fixture.checksum_failure();
             fixture.cancel_restore();

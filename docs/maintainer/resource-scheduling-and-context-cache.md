@@ -396,8 +396,9 @@ Host 先释放安全的重复副本，再对有限物理动作作完整预检：
 回答一组检查点能否整体降级（`whole` 与首个原因 `block`：`Unavailable`、`Lost`、`Busy`、
 `Unspillable`、`Unreleasable`、`Full`），`release_cold_host` 只整体释放。未满尾页在没有 writer 时对
 检查点不可变，按整页大小的冷对象落盘并记录 committed columns；之后若被续写，列数变化使副本失效
-并释放。仍有多个检查点共享的对象被一个检查点降级释放 Host 后，其他共享者对该对象也变为仅冷，
-恢复按对象读回。
+并释放。仍被非受害者持有的共享页（引用数大于该批受害者对它的引用数）不释放 Host 副本：它照常落盘一次，
+Host 与 SSD 并存，非受害者持有者不会因别人的降级而变成仅冷；待持有者都被降级后才可释放。
+StateImage 属于单个检查点，不受影响。
 
 策略（`split_host_victims` 同时是只读报价 `HostVictimPolicy::erased`）：
 
@@ -424,8 +425,10 @@ Device-only 检查点优先降级到 Host、再由上述策略落到 SSD，而�
   SSD，按需擦除；`host_victims_in_order` 先取全部持有者都过期的动作，按其最新持有者的空闲时间
   从旧到新，其余仍按普通排序。命中恢复后的采用刷新 `touched`，被命中者自然不过期。
   `split_host_victims` 是 `erased` 报价与 `dispose` 共用的唯一分类。
-- **写批上限**：一批压力写入或预写不超过 2 GiB（第一个受害者总在批内），其余受害者留在 Host，
-  等待下一批。
+- **写批上限**：一批压力写入不超过 2 GiB（`kColdWriteBatchBytes`），预写批不超过 256 MiB
+  （`kColdPrewriteBatchBytes`，避免预写拖长压力回收）；第一个受害者总在批内，其余留在 Host，等待下一批。
+- **写批在途时的 Device 压力**：带 Host 受害者的降级动作遇到在途批次时，回收返回 `Spilling` 并等待；
+  排在它之后的擦除动作同样不执行（否则会删掉这批写入即将腾出空间所保护的内容），排在它之前的动作照常执行。
 - **SSD 满**：整批报价为 `Full` 时不整批删除。Engine 维护自己写过的 SSD 驻留检查点集合（spill 完成时
   登记、惰性清理），按 `touched` 从最旧开始淘汰：仍有其他副本者 `drop_cold`，仅冷者整体擦除；淘汰
   不写盘；等待引用与 hold（恢复中）不淘汰。比本批某受害者更新的内容不为它淘汰：比最旧可淘汰内容

@@ -352,6 +352,11 @@ public:
     // Residency of the State/KV covered by one checkpoint, as read by a binding.
     enum class ColdResidency : std::uint8_t { Resident, ColdOnly, Lost };
     [[nodiscard]] ColdResidency cold_residency(CheckpointHandle) const;
+    // For each KV page of these checkpoints, how many of them hold it (a page counts once per
+    // checkpoint). Compared with the page's address references it tells whether a holder outside
+    // the set still uses it.
+    [[nodiscard]] std::unordered_map<std::uint64_t, std::uint32_t>
+    victim_page_holders(std::span<const CheckpointHandle>) const;
     // Visits the checkpoint's StateImage and the logical pages of each enabled KV pool within its
     // recoverable coverage (MTP backend coverage ends one token before the Main frontier).
     template <typename StateVisitor, typename PageVisitor>

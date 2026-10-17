@@ -1685,7 +1685,7 @@ private:
         std::uint64_t batch_bytes = 0;
         for (const auto victim : victims) {
             if (resources_.expired(victim)) {
-                    out.erase.push_back(victim);
+                out.erase.push_back(victim);
                 ++out.expired;
                 continue;
             }
@@ -1706,8 +1706,9 @@ private:
         const auto batch = program.cold_quote(out.keep);
         if (batch.whole) { return out; }
         if (batch.block == ColdDemotionBlock::Full) {
+            std::vector<Checkpoint> failed;
             for (;;) {
-                const auto oldest = oldest_evictable(program, victims);
+                const auto oldest = oldest_evictable(program, victims, failed);
                 if (!oldest) { break; }
                 // Never evict newer SSD content for a victim that is older than it.
                 const auto idle = resources_.idle_for(*oldest);
@@ -1722,7 +1723,7 @@ private:
                 if (out.keep.empty() || program.cold_quote(out.keep).whole) { return out; }
                 // The quote assumes eviction makes room; dispose performs it.
                 if (!commit) { return out; }
-                evict_cold(program, *oldest);
+                if (!evict_cold(program, *oldest)) { failed.push_back(*oldest); }
                 if (program.cold_quote(out.keep).whole) { return out; }
             }
         }
@@ -1734,7 +1735,8 @@ private:
     // The SSD-resident checkpoint with the oldest real demand that may be evicted: not one of
     // the victims, not waiting or held (a restore holds its checkpoint), with an SSD copy.
     std::optional<Checkpoint> oldest_evictable(typename ModelContract::Program& program,
-                                               std::span<const Checkpoint> victims) {
+                                               std::span<const Checkpoint> victims,
+                                               std::span<const Checkpoint> failed) {
         std::erase_if(cold_resident_, [&](auto handle) {
             if (!program.valid_checkpoint(handle)) { return true; }
             const auto quote = program.cold_quote({&handle, 1});
@@ -1744,6 +1746,7 @@ private:
         std::chrono::nanoseconds oldest_idle{};
         for (const auto handle : cold_resident_) {
             if (std::find(victims.begin(), victims.end(), handle) != victims.end() ||
+                std::find(failed.begin(), failed.end(), handle) != failed.end() ||
                 resources_.pinned(handle)) {
                 continue;
             }
@@ -1757,19 +1760,21 @@ private:
     }
 
     // Evicts one checkpoint from the SSD without writing anything: a checkpoint that is still
-    // resident elsewhere drops its SSD copies; a cold-only one is erased whole.
-    void evict_cold(typename ModelContract::Program& program, Checkpoint handle) {
-        std::erase(cold_resident_, handle);
+    // resident elsewhere drops its SSD copies; a cold-only one is erased whole. A checkpoint
+    // that could not be erased stays tracked; the caller skips it for this round.
+    bool evict_cold(typename ModelContract::Program& program, Checkpoint handle) {
         const auto quote    = program.cold_quote({&handle, 1});
         std::uint64_t bytes = 0;
         if (quote.restore_objects) {
-            if (!resources_.erase(program, handle)) { return; }
+            if (!resources_.erase(program, handle)) { return false; }
             bytes = quote.cold_bytes + quote.restore_bytes;
         } else {
             bytes = program.drop_cold({&handle, 1});
         }
+        std::erase(cold_resident_, handle);
         ++cumulative_stats_.cold_evictions;
         cumulative_stats_.cold_evicted_bytes += bytes;
+        return true;
     }
 
     // Host-victim policy of the SSD tier; this function is the replaceable strategy point (its
@@ -1831,7 +1836,7 @@ private:
             if (!program.valid_checkpoint(handle) || resources_.expired(handle)) { continue; }
             const auto quote = program.cold_quote({&handle, 1});
             if (!quote.whole || quote.write_objects == 0) { continue; }
-            if (!batch.empty() && bytes + quote.write_bytes > kColdWriteBatchBytes) { break; }
+            if (!batch.empty() && bytes + quote.write_bytes > kColdPrewriteBatchBytes) { break; }
             bytes += quote.write_bytes;
             batch.push_back(handle);
         }
@@ -2884,6 +2889,8 @@ private:
     std::vector<Checkpoint> prewritten_;
     // Upper bound of one pressure or pre-write batch (the store's in-flight write window).
     static constexpr std::uint64_t kColdWriteBatchBytes = 2ULL << 30U;
+    // A pre-write holds Host reclaim like a pressure batch does, so it stays one small batch.
+    static constexpr std::uint64_t kColdPrewriteBatchBytes = 256ULL << 20U;
     std::optional<std::chrono::nanoseconds> cold_demote_window_;
     std::uint32_t cold_prewrite_watermark_percent_ = 0;
     Clock::time_point next_prewrite_check_{};

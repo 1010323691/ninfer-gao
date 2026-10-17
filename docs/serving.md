@@ -949,8 +949,8 @@ binding. A checkpoint moves to the SSD whole: its Host copies are released only 
 covered StateImage and KV page, partial tail page included, has an SSD copy. Under Device pressure,
 demoting history to Host (and from there to the SSD) ranks ahead of erasing it.
 History idle longer than the demote window is not written: it is erased when space is needed,
-oldest first. A write batch is bounded to 2 GiB; further victims wait in Host for the next
-batch. When the SSD is full, the SSD checkpoint with the oldest real demand is evicted (its SSD
+oldest first. A pressure write batch is bounded to 2 GiB and a pre-write batch to 256 MiB; further victims
+wait in Host for the next batch. When the SSD is full, the SSD checkpoint with the oldest real demand is evicted (its SSD
 copies are released, or a cold-only checkpoint is erased; nothing is written), except that a
 victim older than every evictable SSD checkpoint is erased instead. Checkpoints that a request
 waits for or that are being restored are never evicted. Below the Host free watermark, victims
@@ -960,7 +960,9 @@ reclaim waits for an in-flight pre-write batch. Write volume is not throttled; w
 exclusive lock on the directory,
 deletes its `seg_*.bin` files, and refuses RAM-backed (tmpfs/ramfs) directories, directories
 without `O_DIRECT`, file systems with less free space than `--ssd-context-gib` plus 1 GiB, and
-devices slower than 500 MB/s in a 512 MiB startup write/read probe. The probe's read rate prices
+devices slower than 500 MB/s in a 512 MiB startup write/read probe (a consumer NVMe can measure close
+to that floor; check the probe result before relying on the tier). The default 100 GiB capacity needs
+that much free space on the file system; pass a smaller `--ssd-context-gib` otherwise. The probe's read rate prices
 SSD restores in source selection. Repeated I/O failures or an I/O exceeding 30 s disable the tier
 for the rest of the process; a copy that fails its checksum is discarded and the request falls
 back to another source or prefill. Startup writes are counted in the SSD write totals.

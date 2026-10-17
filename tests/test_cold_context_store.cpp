@@ -409,6 +409,8 @@ int main(int argc, char** argv) {
         } else {
             g_root = std::filesystem::current_path() / "cold-store-test";
         }
+        // Only this run's own subdirectory is created and removed under a caller-given root.
+        g_root /= "store-test-" + std::to_string(static_cast<long>(getpid()));
         std::filesystem::create_directories(g_root);
         test_crc32c();
         test_rejects_tmpfs();
