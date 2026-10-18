@@ -1012,7 +1012,8 @@ curl http://127.0.0.1:8080/metrics
 | `ninfer_ssd_context_demote_window_seconds`, `ninfer_ssd_context_prewrite_watermark_percent` | Configured age rule window and pre-write watermark |
 | `ninfer_ssd_context_expired_erasures_total` | Host-pressure victims erased by the age rule (a subset of `erased_checkpoints`) |
 | `ninfer_ssd_context_{evictions,evicted_bytes}_total` | Checkpoints evicted from a full SSD tier for newer victims, and the SSD copy bytes they held |
-| `ninfer_ssd_context_{prewrites,prewrite_wasted}_total` | Checkpoints pre-written below the watermark, and those erased or evicted before a demotion used the copy |
+| `ninfer_ssd_context_{prewrites,prewrite_wasted}_total` | Checkpoints pre-written below the watermark, and those erased or evicted before a demotion used the copy; each pre-written checkpoint counts once |
+| `ninfer_ssd_context_prewrite_releases_total` | Host-pressure dispositions released at once from pre-written copies; they start no spill, so `spills_total` excludes them |
 | `ninfer_host_work_seconds_total{phase}`, `ninfer_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
 | `ninfer_constraint_requests_total{outcome}`, `ninfer_constraint_cache_total{result}` | Settled constrained requests by completion state and compilation-cache access |
 | `ninfer_constraint_{prepare,mask,matcher}_seconds_total`, `ninfer_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results |
@@ -1042,7 +1043,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v26 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v27 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -1158,7 +1159,12 @@ same interval. The
 `capture_pending`, and `terminal_pending` fields are the Engine scheduler snapshot at the end of the
 interval. The JSONL `context_cache` object reports selections, captures, StateImage operations,
 transfers, tail-page COW, pressure spills, reclaim-erased checkpoints with their Device-pressure
-share (`pressure.device_erased_checkpoints`) and `pressure.spilled_demotions` as interval deltas; `occupancy` and `last_selection` are
+share (`pressure.device_erased_checkpoints`), that share by cause (`pressure.device_erasures`:
+`no_demotion` when Native quoted none, `unadmitted` or `no_host_destination` when every quoted
+demotion was refused admission or had no Host destination, `ranked_first` when the erasure ranked
+ahead of a demotion, `demotion_failed` when a demotion ranked ahead but its Host victims changed or
+it could not start; the five sum to `device_erased_checkpoints`) and `pressure.spilled_demotions` as
+interval deltas; `occupancy` and `last_selection` are
 end-of-interval gauges. The separate `scheduling` object reports preemptions, restores and replayed
 tokens. Occupancy includes Host reservations while transfers are in flight. With
 `--ssd-context-dir`, `context_cache.cold` adds SSD tier gauges (`capacity_bytes`, `segments`, `segment_bytes`,
@@ -1166,7 +1172,13 @@ tokens. Occupancy includes Host reservations while transfers are in flight. With
 `write_bytes_24h`, both including the startup probe, probe rates, `disabled`) and interval deltas (`write_bytes`, `read_bytes`,
 failures, spill and restore counts, `spill_host_bytes_released`, `erased_checkpoints`,
 `expired_erasures`, `evictions`, `evicted_bytes`, `prewrites`, `prewrite_wasted`,
-`lost_checkpoints`, `restore_bytes`, `restore_seconds`). `server_start.engine.context_cache` records
+`prewrite_releases`, `victim_erasures`, `lost_checkpoints`, `restore_bytes`, `restore_seconds`).
+A Host-pressure disposition whose victims all hold pre-written copies releases them at once:
+it counts in `prewrite_releases` and `spill_host_bytes_released`, not in `spills_*`.
+`victim_erasures` splits `erased_checkpoints` other than `expired_erasures` by the first reason a
+victim could not be demoted whole: `busy` (an SSD transfer in flight), `unspillable` (a tail a
+writer can still extend), `unreleasable` (a pinned Host replica or the cold-only limit), `lost`,
+and `no_room` (SSD full without evictable content, or the tier unavailable). `server_start.engine.context_cache` records
 `ssd_directory`, `ssd_capacity_bytes`, `ssd_demote_window_seconds` and
 `ssd_prewrite_watermark_percent`.
 
@@ -1174,7 +1186,9 @@ The JSONL `throughput.host_work` object is the aggregation authority: the Engine
 wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five
 mutually exclusive Host phases and their `total`; `device_wait_seconds` is separate.
 `work_class_seconds` splits Host and Device-wait time into decode, prefill, and control classes.
-`detail_subset_seconds` and `detail_invocations` expose stats-publication work; these detail values
+`detail_subset_seconds` and `detail_invocations` expose stats-publication work, SSD-tier
+maintenance (`cold_maintenance`: the pre-write scan and its settlement) and context reclaim
+decisions (`context_reclaim`); these detail values
 are already contained in a top-level Host phase and must not be added to `total`.
 Per-round, per-row-round, and per-invocation normalized values are
 `null` when their denominator is zero. Pretty throughput contains nonzero token rates and counts,

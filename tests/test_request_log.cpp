@@ -738,6 +738,10 @@ int main() {
     throughput.current.cold_write_bytes_24h             = 4500;
     throughput.current.cold_only_states                 = 2;
     throughput.current.cold_restores_completed          = 3;
+    throughput.current.cold_prewrite_releases           = 6;
+    throughput.current.cold_victim_erasures_unspillable = 2;
+    throughput.previous.reclaim_device_erasures_ranked_first = 1;
+    throughput.current.reclaim_device_erasures_ranked_first  = 4;
     throughput.current.host_work                        = {
                                .engine_boundary_ns            = 1000000,
                                .program_submit_ns             = 2000000,
@@ -755,6 +759,8 @@ int main() {
                                .control_units                 = 1,
                                .stats_publication_ns          = 250000,
                                .stats_publication_invocations = 5,
+                               .cold_maintenance_ns           = 600000,
+                               .cold_maintenance_invocations  = 3,
     };
     const std::string pretty_throughput = render_throughput(throughput).message;
     failures +=
@@ -797,8 +803,22 @@ int main() {
     const Json& cold = throughput_json.at("context_cache").at("cold");
     failures += check(cold.at("write_bytes") == 4000 && cold.at("write_bytes_total") == 5000 &&
                           cold.at("write_bytes_24h") == 4500 && cold.at("cold_only_states") == 2 &&
-                          cold.at("restores_completed") == 3 && !cold.at("disabled").get<bool>(),
+                          cold.at("restores_completed") == 3 && !cold.at("disabled").get<bool>() &&
+                          cold.at("prewrite_releases") == 6 &&
+                          cold.at("victim_erasures").at("unspillable") == 2 &&
+                          cold.at("victim_erasures").at("busy") == 0,
                       "SSD tier throughput fields mismatch");
+    const Json& host_work = throughput_json.at("host_work");
+    const Json& erasures  = throughput_json.at("context_cache").at("pressure").at("device_erasures");
+    failures += check(
+        erasures.at("ranked_first") == 3 && erasures.at("no_host_destination") == 0 &&
+            host_work.at("detail_invocations").at("cold_maintenance") == 3 &&
+            std::abs(host_work.at("detail_microseconds_per_invocation")
+                         .at("cold_maintenance")
+                         .get<double>() -
+                     200.0) < 1.0e-12 &&
+            host_work.at("detail_microseconds_per_invocation").at("context_reclaim").is_null(),
+        "reclaim causes or SSD maintenance detail mismatch");
     failures += check(!Json::parse(format_throughput_json("serve-test", 5000, single_decode))
                            .at("context_cache")
                            .contains("cold"),

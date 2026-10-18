@@ -166,6 +166,17 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.reclaim_erased_checkpoints       = resources_.reclaim_erasures();
     snapshot.reclaim_device_erased_checkpoints = resources_.device_release_erasures();
     snapshot.reclaim_spilled_demotions        = resources_.spilled_demotions();
+    using Cause = typename ResourceManagement::DeviceErasureCause;
+    snapshot.reclaim_device_erasures_no_demotion =
+        resources_.device_release_erasures(Cause::NoDemotion);
+    snapshot.reclaim_device_erasures_unadmitted =
+        resources_.device_release_erasures(Cause::Unadmitted);
+    snapshot.reclaim_device_erasures_no_host_destination =
+        resources_.device_release_erasures(Cause::NoHostDestination);
+    snapshot.reclaim_device_erasures_ranked_first =
+        resources_.device_release_erasures(Cause::RankedFirst);
+    snapshot.reclaim_device_erasures_demotion_failed =
+        resources_.device_release_erasures(Cause::DemotionFailed);
     const auto physical                       = instance_.program->physical_usage();
     snapshot.device_state_occupied_slots      = physical.occupied.state_slots;
     snapshot.device_main_kv_occupied_pages    = physical.occupied.main_kv_pages;

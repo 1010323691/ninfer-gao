@@ -1804,6 +1804,72 @@ void test_lower_tier_quote_ranks_demotion_ahead_of_device_erasure() {
     }
 }
 
+// Reused histories rank by demand. A Host victim the lower tier takes whole stays recoverable, so
+// its newer demand must not push the demotion behind erasing the older Device history.
+void test_reused_demotion_beats_erasure_when_lower_tier_takes_victims() {
+    using ninfer::runtime::ReclaimProgress;
+    const auto setup = [](Fixture& f) {
+        const auto movable                               = f.program.add(tokens(2000));
+        f.program.contents[movable.index].demotion_bytes = 32;
+        const auto device                                = f.program.add(tokens(500, 10000));
+        const auto host = f.program.add(tokens(1000, 20000), {f.program.host_block(32)});
+        f.program.contents[host.index].device_state = false;
+        f.publish(movable);
+        f.publish(device);
+        f.publish(host);
+        f.use_shared(movable);
+        f.use_shared(device);
+        f.use_shared(host);
+        return std::array{movable, device, host};
+    };
+    {
+        Fixture f(32);
+        const auto [movable, device, host] = setup(f);
+        bool pending                       = false;
+        std::vector<Handle> disposed;
+        f.cache.set_host_victim_policy(
+            {.dispose =
+                 [&](Program&, std::span<const Handle> victims) {
+                     disposed.assign(victims.begin(), victims.end());
+                     pending = true;
+                     return Fixture::Cache::HostVictimDisposal{.pending = true};
+                 },
+             .erased  = [](Program&, std::span<const Handle>) { return std::vector<Handle>{}; },
+             .pending = [&] { return pending; }});
+        require(f.cache.reclaim(f.program, {.state_slots = 1}) == ReclaimProgress::Spilling &&
+                    disposed == std::vector<Handle>{host} && f.program.valid_checkpoint(movable) &&
+                    f.program.valid_checkpoint(device) && f.program.valid_checkpoint(host) &&
+                    f.program.released.empty(),
+                "a newer Host victim the lower tier takes whole made Device pressure erase");
+        require(f.cache.spilled_demotions() == 1 && f.cache.device_release_erasures() == 0,
+                "the reused demotion was not the chosen action");
+    }
+    {
+        // Without a lower tier the Host victim would be erased; its demand still counts.
+        Fixture f(32);
+        const auto [movable, device, host] = setup(f);
+        f.cache.set_host_victim_policy(
+            {.dispose =
+                 [&](Program&, std::span<const Handle> victims) {
+                     return Fixture::Cache::HostVictimDisposal{
+                         .erase = std::vector<Handle>(victims.begin(), victims.end())};
+                 },
+             .erased =
+                 [](Program&, std::span<const Handle> victims) {
+                     return std::vector<Handle>(victims.begin(), victims.end());
+                 },
+             .pending = [] { return false; }});
+        require(f.cache.reclaim(f.program, {.state_slots = 1}) == ReclaimProgress::Changed &&
+                    !f.program.valid_checkpoint(movable) && f.program.valid_checkpoint(device) &&
+                    f.program.valid_checkpoint(host) && f.program.demoted.empty(),
+                "an erasing lower tier changed the demand ranking");
+        using Cause = Fixture::Cache::DeviceErasureCause;
+        require(f.cache.device_release_erasures() == 1 && f.cache.spilled_demotions() == 0 &&
+                    f.cache.device_release_erasures(Cause::NoHostDestination) == 1,
+                "the Device-pressure deletion was not counted with its cause");
+    }
+}
+
 void test_adjacent_kv_demotions_share_one_submission() {
     Fixture f(64);
     const auto first                                = f.program.add(tokens(100));
@@ -2147,6 +2213,7 @@ int main() {
         test_physical_host_alias_uses_all_holders_priority();
         test_host_victim_policy_takes_victims_before_erasure();
         test_lower_tier_quote_ranks_demotion_ahead_of_device_erasure();
+        test_reused_demotion_beats_erasure_when_lower_tier_takes_victims();
         test_age_rule_takes_expired_victims_first();
         test_age_rule_hit_refreshes_demand();
         test_age_rule_active_owner_is_not_idle();

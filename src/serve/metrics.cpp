@@ -267,6 +267,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
                 "Checkpoints pre-written to the SSD below the Host free watermark.");
         COUNTER(cold_prewrite_wasted, "ssd_context_prewrite_wasted_total",
                 "Pre-written checkpoints erased or evicted before a demotion used the copy.");
+        COUNTER(cold_prewrite_releases, "ssd_context_prewrite_releases_total",
+                "Host-pressure dispositions released at once from pre-written copies.");
     }
 #undef GAUGE
 #undef COUNTER

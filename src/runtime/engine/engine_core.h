@@ -1293,8 +1293,10 @@ private:
                     }
                 }
             }
-            const auto progress =
-                resources_.reclaim(*instance_.program, capture->shortage, {}, decision->reclaim);
+            const auto progress = timed_reclaim([&] {
+                return resources_.reclaim(*instance_.program, capture->shortage, {},
+                                          decision->reclaim);
+            });
             if (progress == ReclaimProgress::Transferring ||
                 progress == ReclaimProgress::Spilling) {
                 return false;
@@ -1548,6 +1550,14 @@ private:
     // an SSD write still in flight; retry after its cold completion.
     enum class ReclaimOutcome : std::uint8_t { None, Progress, Wait };
 
+    template <class Reclaim> ReclaimProgress timed_reclaim(Reclaim&& run) {
+        const auto started  = Clock::now();
+        const auto progress = run();
+        record_detail(&RuntimeHostWorkStats::context_reclaim_ns,
+                      &RuntimeHostWorkStats::context_reclaim_invocations, started);
+        return progress;
+    }
+
     ReclaimOutcome reclaim(ContextResourceUsage shortage, bool allow_pause,
                            std::span<const Checkpoint> excluded               = {},
                            typename ResourceManagement::ReclaimCursor* cursor = nullptr,
@@ -1560,9 +1570,10 @@ private:
             request_admission_check();
             return ReclaimOutcome::Progress;
         }
-        const auto progress =
-            cursor ? resources_.reclaim(*instance_.program, shortage, excluded, *cursor)
-                   : resources_.reclaim(*instance_.program, shortage, excluded);
+        const auto progress = timed_reclaim([&] {
+            return cursor ? resources_.reclaim(*instance_.program, shortage, excluded, *cursor)
+                          : resources_.reclaim(*instance_.program, shortage, excluded);
+        });
         if (progress == ReclaimProgress::Spilling) { return ReclaimOutcome::Wait; }
         if (progress != ReclaimProgress::Blocked) {
             if (progress == ReclaimProgress::Changed) {
@@ -1673,6 +1684,30 @@ private:
     struct VictimSplit {
         std::vector<Checkpoint> keep, erase;
         std::uint64_t expired = 0;
+        // Erased victims that were not expired, by the reason of their whole-demotion quote.
+        std::uint64_t busy = 0, unspillable = 0, unreleasable = 0, lost = 0, no_room = 0;
+
+        void note_blocked(ColdDemotionBlock block) noexcept {
+            switch (block) {
+            case ColdDemotionBlock::Busy:
+                ++busy;
+                break;
+            case ColdDemotionBlock::Unspillable:
+                ++unspillable;
+                break;
+            case ColdDemotionBlock::Unreleasable:
+                ++unreleasable;
+                break;
+            case ColdDemotionBlock::Lost:
+                ++lost;
+                break;
+            case ColdDemotionBlock::None:
+            case ColdDemotionBlock::Unavailable:
+            case ColdDemotionBlock::Full:
+                ++no_room;
+                break;
+            }
+        }
     };
 
     // The single classification behind both the read-only `erased` quote (commit false) and
@@ -1692,6 +1727,7 @@ private:
             const auto quote = program.cold_quote({&victim, 1});
             if (!quote.whole && quote.block != ColdDemotionBlock::Full) {
                 out.erase.push_back(victim);
+                out.note_blocked(quote.block);
                 continue;
             }
             // A bounded batch keeps Device pressure from waiting on an unbounded write; the
@@ -1715,6 +1751,7 @@ private:
                 for (auto it = out.keep.begin(); it != out.keep.end();) {
                     if (resources_.idle_for(*it) > idle) {
                         out.erase.push_back(*it);
+                        ++out.no_room;
                         it = out.keep.erase(it);
                     } else {
                         ++it;
@@ -1726,6 +1763,9 @@ private:
                 if (!evict_cold(program, *oldest)) { failed.push_back(*oldest); }
                 if (program.cold_quote(out.keep).whole) { return out; }
             }
+        }
+        for (std::size_t index = 0; index < out.keep.size(); ++index) {
+            out.note_blocked(batch.block);
         }
         out.erase.insert(out.erase.end(), out.keep.begin(), out.keep.end());
         out.keep.clear();
@@ -1785,6 +1825,11 @@ private:
                          std::span<const Checkpoint> victims) {
         auto split = split_host_victims(program, victims, true);
         cumulative_stats_.cold_expired_erasures += split.expired;
+        cumulative_stats_.cold_victim_erasures_busy += split.busy;
+        cumulative_stats_.cold_victim_erasures_unspillable += split.unspillable;
+        cumulative_stats_.cold_victim_erasures_unreleasable += split.unreleasable;
+        cumulative_stats_.cold_victim_erasures_lost += split.lost;
+        cumulative_stats_.cold_victim_erasures_no_room += split.no_room;
         if (!split.keep.empty()) {
             const auto start = program.start_spill(split.keep);
             if (start.status == ColdStartStatus::Started) {
@@ -1798,11 +1843,13 @@ private:
                                       ? program.release_cold_host(split.keep)
                                       : 0;
             if (released) {
+                ++cumulative_stats_.cold_prewrite_releases;
                 cumulative_stats_.cold_spill_host_bytes_released += released;
                 cumulative_stats_.cold_erased_checkpoints += split.erase.size();
                 return {.erase = std::move(split.erase)};
             }
             // Full despite the quote (file system space), Unavailable, or nothing released.
+            cumulative_stats_.cold_victim_erasures_no_room += split.keep.size();
             split.erase.insert(split.erase.end(), split.keep.begin(), split.keep.end());
         }
         cumulative_stats_.cold_erased_checkpoints += split.erase.size();
@@ -1811,7 +1858,10 @@ private:
 
     // Watermark pre-write: below the Host free watermark, write the next Host victims inside the
     // demote window to the SSD without releasing Host, so a later pressure demotion only
-    // releases. Still pressure driven, one bounded batch at a time.
+    // releases. Still pressure driven, one bounded batch at a time, and bounded ahead: once the
+    // pre-written Host bytes a demotion could release cover the watermark share of Host, nothing
+    // more is written. A scan that found nothing is repeated only after the Host occupancy or
+    // the SSD tier changed.
     bool maybe_prewrite() {
         auto& program = *instance_.program;
         if (!program.cold_enabled() || cold_prewrite_watermark_percent_ == 0 || pressure_spill_ ||
@@ -1821,23 +1871,42 @@ private:
         const auto now = Clock::now();
         if (now < next_prewrite_check_) { return false; }
         next_prewrite_check_ = now + std::chrono::milliseconds(100);
-        settle_prewritten(program);
         if (program.has_context_transaction()) { return false; }
         const auto usage    = program.physical_usage();
         const auto capacity = static_cast<std::uint64_t>(usage.capacity.host_bytes);
         const auto occupied = std::min<std::uint64_t>(capacity, usage.occupied.host_bytes);
-        if (!capacity ||
-            (capacity - occupied) * 100U >= capacity * cold_prewrite_watermark_percent_) {
-            return false;
+        const PrewriteScan scan{.host_occupied = occupied, .cold_events = cold_events_};
+        if (prewrite_idle_ && *prewrite_idle_ == scan) { return false; }
+        const auto started = Clock::now();
+        settle_prewritten(program);
+        const bool below = capacity && (capacity - occupied) * 100U <
+                                           capacity * cold_prewrite_watermark_percent_;
+        const bool written = below && start_prewrite(program, capacity);
+        if (written) {
+            prewrite_idle_.reset();
+        } else {
+            prewrite_idle_ = scan;
         }
+        record_detail(&RuntimeHostWorkStats::cold_maintenance_ns,
+                      &RuntimeHostWorkStats::cold_maintenance_invocations, started);
+        return written;
+    }
+
+    bool start_prewrite(typename ModelContract::Program& program, std::uint64_t host_capacity) {
+        const auto lead = host_capacity * cold_prewrite_watermark_percent_ / 100U;
+        std::uint64_t ahead =
+            prewritten_.empty() ? 0 : program.cold_quote(prewritten_).host_bytes_released_after_spill;
+        if (ahead >= lead) { return false; }
         std::vector<Checkpoint> batch;
         std::uint64_t bytes = 0;
         for (const auto handle : resources_.victim_order()) {
+            if (ahead >= lead) { break; }
             if (!program.valid_checkpoint(handle) || resources_.expired(handle)) { continue; }
             const auto quote = program.cold_quote({&handle, 1});
             if (!quote.whole || quote.write_objects == 0) { continue; }
             if (!batch.empty() && bytes + quote.write_bytes > kColdPrewriteBatchBytes) { break; }
             bytes += quote.write_bytes;
+            ahead += quote.host_bytes_released_after_spill;
             batch.push_back(handle);
         }
         if (batch.empty() || !program.cold_quote(batch).whole) { return false; }
@@ -1848,7 +1917,7 @@ private:
     }
 
     // Pre-written checkpoints are used once a pressure demotion releases their Host replicas;
-    // erased or evicted before that, the write was wasted.
+    // erased or evicted before that, the write was wasted. Each checkpoint is tracked once.
     void settle_prewritten(typename ModelContract::Program& program) {
         std::erase_if(prewritten_, [&](auto handle) {
             if (!program.valid_checkpoint(handle)) {
@@ -1863,6 +1932,16 @@ private:
             }
             return false;
         });
+    }
+
+    void track_prewritten(typename ModelContract::Program& program,
+                          std::span<const Checkpoint> checkpoints) {
+        for (const auto handle : checkpoints) {
+            if (program.valid_checkpoint(handle) &&
+                std::find(prewritten_.begin(), prewritten_.end(), handle) == prewritten_.end()) {
+                prewritten_.push_back(handle);
+            }
+        }
     }
 
     void register_cold_resident(typename ModelContract::Program& program,
@@ -1969,15 +2048,14 @@ private:
         const auto completions = program.poll_cold();
         if (completions.empty()) { return false; }
         const auto now = Clock::now();
+        cold_events_ += completions.size();
         for (const auto& completion : completions) {
             if (completion.kind == ColdJobKind::Spill) {
                 if (prewrite_ && prewrite_->job == completion.job) {
                     if (completion.status == ColdJobStatus::Completed) {
                         cumulative_stats_.cold_prewrites += prewrite_->checkpoints.size();
                         register_cold_resident(program, prewrite_->checkpoints);
-                        for (const auto handle : prewrite_->checkpoints) {
-                            if (program.valid_checkpoint(handle)) { prewritten_.push_back(handle); }
-                        }
+                        track_prewritten(program, prewrite_->checkpoints);
                     } else {
                         // Objects written before the failure keep their copies: track them so a
                         // full SSD can evict them.
@@ -2650,6 +2728,7 @@ private:
         prewrite_.reset();
         cold_resident_.clear();
         prewritten_.clear();
+        prewrite_idle_.reset();
         resources_.release_all(*instance_.program);
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
@@ -2892,6 +2971,14 @@ private:
     // pre-written checkpoints whose use is not settled yet.
     std::vector<Checkpoint> cold_resident_;
     std::vector<Checkpoint> prewritten_;
+    // What the last pre-write maintenance saw when it started nothing; unchanged, it is skipped.
+    struct PrewriteScan {
+        std::uint64_t host_occupied = 0;
+        std::uint64_t cold_events   = 0;
+        bool operator==(const PrewriteScan&) const = default;
+    };
+    std::optional<PrewriteScan> prewrite_idle_;
+    std::uint64_t cold_events_ = 0;
     // Upper bound of one pressure or pre-write batch (the store's in-flight write window).
     static constexpr std::uint64_t kColdWriteBatchBytes = 2ULL << 30U;
     // A pre-write holds Host reclaim like a pressure batch does, so it stays one small batch.

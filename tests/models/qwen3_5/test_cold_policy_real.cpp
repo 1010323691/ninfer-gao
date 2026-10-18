@@ -42,7 +42,6 @@ struct Policy {
 struct Outcome {
     ninfer::RuntimeStats stats;
     std::uint64_t last_round_expired = 0;
-    std::uint64_t last_round_spills  = 0;
 };
 
 ninfer::EngineOptions options(const char* artifact, const std::filesystem::path& cold,
@@ -114,8 +113,9 @@ void print_cold(std::string_view label, const ninfer::RuntimeStats& stats) {
               << stats.cold_spills_completed << " erased " << stats.cold_erased_checkpoints
               << " expired " << stats.cold_expired_erasures << " evictions "
               << stats.cold_evictions << " (" << stats.cold_evicted_bytes << " B) prewrites "
-              << stats.cold_prewrites << " wasted " << stats.cold_prewrite_wasted
-              << " restores " << stats.cold_restores_completed << " cold-only states "
+              << stats.cold_prewrites << " wasted " << stats.cold_prewrite_wasted << " releases "
+              << stats.cold_prewrite_releases << " restores " << stats.cold_restores_completed
+              << " cold-only states "
               << stats.cold_only_states << " write " << stats.cold_write_bytes << '\n';
 }
 
@@ -192,7 +192,6 @@ Outcome drive(const char* artifact, const std::filesystem::path& root,
         wait_idle(engine);
         const auto after = engine.runtime_stats();
         outcome.last_round_expired = after.cold_expired_erasures - before.cold_expired_erasures;
-        outcome.last_round_spills  = after.cold_spills_completed - before.cold_spills_completed;
         print_cold("round " + std::to_string(round), after);
         if (pause.count()) { std::this_thread::sleep_for(pause); }
     }
@@ -223,9 +222,11 @@ void expired_content_is_erased(const char* artifact, const std::filesystem::path
     print_cold("age rule", outcome.stats);
     require(outcome.stats.cold_expired_erasures >= 1,
             "no content past the demote window was erased on demand");
-    // After each pause everything older is expired, so the last round erases instead of writing.
-    require(outcome.last_round_expired > outcome.last_round_spills,
-            "expired content was written instead of erased in the last round");
+    // After each pause everything older is expired, so the last round erases it on demand. Its
+    // spills are this round's own content, which Device pressure demotes while still inside the
+    // window; expired victims are erased before any quote (split_host_victims) and never written.
+    require(outcome.last_round_expired >= 1,
+            "content older than the window was not erased on demand in the last round");
 }
 
 // Below the Host watermark the next victims are written ahead without releasing Host; a
@@ -250,6 +251,11 @@ void watermark_prewrites(const char* artifact, const std::filesystem::path& root
     print_cold("after pressure", engine.runtime_stats());
     require(engine.runtime_stats().cold_only_states >= 1,
             "pressure never released a pre-written history from Host");
+    require(engine.runtime_stats().cold_prewrite_releases >= 1,
+            "no pressure disposition released pre-written copies without a spill");
+    // Each pre-written checkpoint is tracked once, so at most every one of them is wasted.
+    require(engine.runtime_stats().cold_prewrite_wasted <= engine.runtime_stats().cold_prewrites,
+            "pre-write waste was counted more than once per pre-written checkpoint");
     const auto before = engine.runtime_stats().cold_restores_completed;
     const auto result =
         engine.generate(engine.prepare_tokens(continuation(1)), request(true));

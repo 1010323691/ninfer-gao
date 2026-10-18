@@ -329,14 +329,20 @@ Runtime 将候选的恢复损失与保留资格用于各项准入检查和排序
 历史的覆盖；同时删除的别名不能充当彼此 fallback。Device→Host 降级在排序前固定所需 Host
 受害者，完整动作的净损失包含其中仍会被删除的受害者：没有冷层时是全部受害者；配置冷层时
 只计 Host 受害者策略报价（§7.4）中不能整体降级到 SSD 的那部分，能整体降级的受害者仍可恢复，
-不计损失。只有无需删除完整恢复内容时才是零损失，不能仅因 Device 来源得到保全就优先。提交前
+不计损失。被计入的受害者同时把它们的需求时间与保留顺序带进降级的排序（复用内容按需求时间
+排序，不看损失）；能整体降级的受害者不带入，否则较新的 Host 受害者会让“删除较旧来源”排在
+“降级它、受害者无损落 SSD”之前。只有无需删除完整恢复内容时才是零损失，不能仅因 Device
+来源得到保全就优先。提交前
 复核同一受害集合，变化后重新报价；提交时若策略实际删除了全部受害者，按完整删除损失计入预算。
 
 删除动作以检查点为单位、按需最小：Native 按物理持有者集合给出候选，KV 删除只释放所删检查点
 超出幸存较浅恢复点的后缀，较浅恢复点保留；有用释放量按当前缺口截断，因此同损失比下不会为
 更大释放量多删；每次提交一个动作后重新查询缺口。删除动作在冷层下保留为兜底：降级不能开始、
 排序落后（例如复用内容的需求时间更早）或没有合法降级时才使用，计入
-`reclaim_device_erased_checkpoints`。
+`reclaim_device_erased_checkpoints`，并按原因细分（`reclaim_device_erasures_*`）：Native 没有
+报出降级（`no_demotion`），所有降级都未获准入（`unadmitted`）或找不到合法 Host 受害者
+（`no_host_destination`），删除排在剩余降级之前（`ranked_first`），或排在前面的降级因受害者
+变化、无法启动而跳过（`demotion_failed`）；五项之和等于总数。
 
 只缺几页时，降级选取满足缺口的有限页组，State 和另一 typed pool 不因同属一条历史而全部搬走。
 有完整 Host 副本时直接释放 Device 副本；否则报价并申请 Host 目的。启动动作前重新验证内容和
@@ -375,8 +381,10 @@ Host 与 Device 分步删除共用预算，累计已经牺牲的恢复覆盖；�
 降级的 Host 受害集合同时满足迁移源与外层可选捕获的保留权限，并受捕获剩余预算约束。必要执行需要 Device 空间
 不会把自己的权限转授给正在尝试保存的冷缓存。保存没有足够收益或空间时跳过，不阻塞必要执行。
 配置冷层后，降级若需要等待 Host 受害者写入 SSD，必要执行随回收一起等待该批写入（`Spilling`），
-而不是改用删除；这是“逐出即降级”的代价，等待上界是一批压力写入。受害者选择（`host_victims_in_order`）
-的保留资格与预算检查仍按删除损失计算，未按冷层报价放宽。
+而不是改用删除；这是“逐出即降级”的代价，等待上界是一批压力写入。降级为自己的 Host 目的选择受害者
+（`host_victims_in_order`）时，保留资格按删除损失与需求时间检查；Host 受害者策略报价能整体降级到 SSD
+的受害者不损失恢复覆盖，只需回收权限，不受“较新需求不可被较旧来源替换”的限制。外层可选捕获的
+资格与其他 Host 回收路径仍按删除损失计算，未按冷层报价放宽。
 
 Host 先释放安全的重复副本，再对有限物理动作作完整预检：实际释放并集足额，且联合持有者都能
 被本次申请替换，才执行删除。Shared 引用的名义大小不重复累加。预检后 allocator 仍须满足
@@ -436,10 +444,17 @@ Device-only 检查点优先降级到 Host、再由上述策略落到 SSD，而�
   空间，只在没有可淘汰内容时报删除。
 - **水位预写**：Host 剩余低于 `cold_prewrite_watermark_percent`（默认 10%）且没有在途批次时，工作循环
   （每 100 ms 至多一次）按受害者顺序为窗口内、可整体降级且缺 SSD 副本的检查点 `start_spill`，不释放
-  Host；之后的压力降级走 `NothingToDo` → 直接整体释放。在途预写也算 `pending`，Host 回收等待它。
-- **计数**：`cold_expired_erasures`（`cold_erased_checkpoints` 的子集）、`cold_evictions`、
-  `cold_evicted_bytes`、`cold_prewrites`、`cold_prewrite_wasted`（预写后在被降级使用前被擦除或淘汰）。
-  写入量不限流，只用 `cold_write_bytes_24h` 监控。
+  Host；之后的压力降级走 `NothingToDo` → 直接整体释放（计入 `cold_prewrite_releases`，不计 spill）。
+  在途预写也算 `pending`，Host 回收等待它。预写有提前量上限：已预写、仍在 Host 上且降级可立即释放的
+  字节（对已预写集合整体 `cold_quote` 的 `host_bytes_released_after_spill`）达到“水位 × Host 容量”时
+  不再写，即只提前写下一次压力回收需要释放的量，而不是把进入 Host 的全部内容写穿。一次扫描若没有
+  开始任何写入，在 Host 占用字节与冷作业完成数都不变之前不再重复扫描。已预写集合每个检查点只登记一次。
+- **计数**：`cold_expired_erasures`（`cold_erased_checkpoints` 的子集）、`cold_victim_erasures_*`（其余
+  删除按首个不能整体降级的原因：`busy`、`unspillable`、`unreleasable`、`lost`、`no_room`）、
+  `cold_evictions`、`cold_evicted_bytes`、`cold_prewrites`、`cold_prewrite_wasted`（预写后在被降级使用前
+  被擦除或淘汰，每个检查点至多一次）、`cold_prewrite_releases`。写入量不限流，只用
+  `cold_write_bytes_24h` 监控。Worker 上的预写维护与回收决策耗时分别计入 host_work 的
+  `cold_maintenance`、`context_reclaim` 细项。
 
 同一时刻至多一批压力写入；它未完成时 Host 回收不再选择新的受害者。spill 不是 Program 上下文事务。
 深度、写入预算尚未纳入策略（写入只监控）。暂停快照为保存 Snapshot 腾 Host 时不能等待写入，仍直接删除

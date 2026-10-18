@@ -1000,6 +1000,12 @@ struct RuntimeHostWorkStats {
 
     std::uint64_t stats_publication_ns          = 0;
     std::uint64_t stats_publication_invocations = 0;
+    // SSD-tier maintenance on the worker (pre-write scan and its settlement) and context reclaim
+    // decisions (ResourceManager::reclaim), both inside the host phases above.
+    std::uint64_t cold_maintenance_ns          = 0;
+    std::uint64_t cold_maintenance_invocations = 0;
+    std::uint64_t context_reclaim_ns           = 0;
+    std::uint64_t context_reclaim_invocations  = 0;
 };
 
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
@@ -1085,6 +1091,14 @@ struct RuntimeStats {
     // Device-pressure share of reclaim_erased_checkpoints: release actions chosen when no
     // demotion ranked first or could start (with the SSD tier, the fallback deletion).
     std::uint64_t reclaim_device_erased_checkpoints = 0;
+    // reclaim_device_erased_checkpoints by why no demotion ran instead: none was quoted, every
+    // quoted one lacked admission or a Host destination, one ranked behind the erasure, or one
+    // ranked ahead but its Host victims changed or it could not start. The five sum to the total.
+    std::uint64_t reclaim_device_erasures_no_demotion         = 0;
+    std::uint64_t reclaim_device_erasures_unadmitted          = 0;
+    std::uint64_t reclaim_device_erasures_no_host_destination = 0;
+    std::uint64_t reclaim_device_erasures_ranked_first        = 0;
+    std::uint64_t reclaim_device_erasures_demotion_failed     = 0;
     // Device-pressure demotions whose Host victims the SSD tier took whole instead of erasing.
     std::uint64_t reclaim_spilled_demotions = 0;
     std::uint32_t device_state_occupied_slots      = 0;
@@ -1150,6 +1164,17 @@ struct RuntimeStats {
     std::uint64_t cold_evicted_bytes              = 0;
     std::uint64_t cold_prewrites                  = 0;
     std::uint64_t cold_prewrite_wasted            = 0;
+    // Host-pressure dispositions released at once from pre-written copies (no spill started);
+    // their Host bytes are part of cold_spill_host_bytes_released.
+    std::uint64_t cold_prewrite_releases = 0;
+    // cold_erased_checkpoints other than the age rule, by the first reason the victim could not
+    // be demoted whole: an SSD transfer in flight, a tail a writer can extend, a pinned Host
+    // replica or the cold-only limit, a lost object, or no SSD room (full or unavailable).
+    std::uint64_t cold_victim_erasures_busy         = 0;
+    std::uint64_t cold_victim_erasures_unspillable  = 0;
+    std::uint64_t cold_victim_erasures_unreleasable = 0;
+    std::uint64_t cold_victim_erasures_lost         = 0;
+    std::uint64_t cold_victim_erasures_no_room      = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

@@ -164,6 +164,20 @@ public:
         return device_release_erasures_;
     }
 
+    // device_release_erasures() by why no demotion ran instead; the causes sum to the total.
+    enum class DeviceErasureCause : std::uint8_t {
+        NoDemotion,        // Native quoted no demotion that releases the shortage
+        Unadmitted,        // every quoted demotion was refused admission
+        NoHostDestination, // a quoted demotion found no legal Host victims for its destination
+        RankedFirst,       // the erasure ranked ahead of every remaining demotion
+        DemotionFailed,    // a demotion ranked ahead, but its Host victims changed or it failed
+    };
+    static constexpr std::size_t kDeviceErasureCauses = 5;
+
+    [[nodiscard]] std::uint64_t device_release_erasures(DeviceErasureCause cause) const noexcept {
+        return device_erasure_causes_[static_cast<std::size_t>(cause)];
+    }
+
     // Device-pressure demotions whose Host victims the policy took (at least one demoted to the
     // lower tier instead of erased).
     [[nodiscard]] std::uint64_t spilled_demotions() const noexcept { return spilled_demotions_; }
@@ -698,11 +712,14 @@ public:
 
         std::vector<Action> actions;
         actions.reserve(plans.demotions.size() + plans.releases.size());
+        // Why demotions left the comparison; attributes a Device erasure that runs instead.
+        bool unadmitted = false, no_host_destination = false;
         for (auto& plan : plans.demotions) {
             const auto units = useful(plan.released, shortage);
             if (!units) { continue; }
             auto facts = action_facts(program, plan.sources, cursor, evaluation);
             if (!admits(program, plan.sources, facts, cursor.admission, cursor, evaluation, true)) {
+                unadmitted = true;
                 continue;
             }
             auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
@@ -712,30 +729,39 @@ public:
                 preservation_admission(program, plan.sources, cursor, facts.priority);
             auto victims =
                 host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
-                                      protected_sources, preservation, cursor, evaluation);
-            if (!victims) { continue; }
+                                      protected_sources, preservation, cursor, evaluation, false,
+                                      true);
+            if (!victims) {
+                no_host_destination = true;
+                continue;
+            }
             auto rank       = rank_action(program, plan.sources, facts, units, evaluation, true);
             auto host_facts = action_facts(program, *victims, cursor, evaluation);
             const auto host_rank = rank_action(program, *victims, host_facts, units, evaluation);
-            rank.loss            = host_rank.loss;
-            if (host_victim_policy_.erased && !victims->empty()) {
-                // A victim the lower tier takes whole stays recoverable: only the victims the
-                // policy would still erase count as this demotion's loss.
+            // The victims this demotion sacrifices: all of them without a lower tier. A victim
+            // the lower tier takes whole stays recoverable, so only the victims the policy would
+            // still erase carry their loss, demand and order into this demotion's rank.
+            auto charged = std::optional<ActionRank>{host_rank};
+            if (victims->empty()) {
+                charged.reset();
+            } else if (host_victim_policy_.erased) {
                 const auto erased = host_victim_policy_.erased(program, *victims);
                 if (erased.empty()) {
-                    rank.loss = 0;
+                    charged.reset();
                 } else if (erased.size() != victims->size()) {
                     auto erased_facts = action_facts(program, erased, cursor, evaluation);
-                    rank.loss =
-                        rank_action(program, erased, erased_facts, units, evaluation).loss;
+                    charged = rank_action(program, erased, erased_facts, units, evaluation);
                 }
             }
-            rank.waiting         = host_rank.waiting;
-            rank.order           = std::max(rank.order, host_rank.order);
-            if (host_rank.priority.reused &&
-                (!rank.priority.reused ||
-                 host_rank.priority.last_demand > rank.priority.last_demand)) {
-                rank.priority = host_rank.priority;
+            rank.loss    = charged ? charged->loss : 0;
+            rank.waiting = host_rank.waiting;
+            if (charged) {
+                rank.order = std::max(rank.order, charged->order);
+                if (charged->priority.reused &&
+                    (!rank.priority.reused ||
+                     charged->priority.last_demand > rank.priority.last_demand)) {
+                    rank.priority = charged->priority;
+                }
             }
             actions.push_back({.demotion     = std::move(plan),
                                .host_victims = std::move(*victims),
@@ -755,7 +781,7 @@ public:
         }
         std::stable_sort(actions.begin(), actions.end(),
                          [](const auto& a, const auto& b) { return less_rank(a.rank, b.rank); });
-        bool waits_for_host = false;
+        bool waits_for_host = false, demotion_failed = false;
         for (std::size_t index = 0; index < actions.size(); ++index) {
             const auto& action = actions[index];
             // A demotion ranked before this erasure waits for a write batch. Erasing past it
@@ -811,8 +837,11 @@ public:
                                          plan.sources.end());
                 const auto current = host_victims_in_order(
                     program, plan.host_bytes, action.preservation->checkpoint, {},
-                    protected_sources, action.preservation, cursor, evaluation);
-                if (!current || *current != action.host_victims) { continue; }
+                    protected_sources, action.preservation, cursor, evaluation, false, true);
+                if (!current || *current != action.host_victims) {
+                    demotion_failed = true;
+                    continue;
+                }
                 const auto host = commit_host_release(program, action.host_victims, cursor,
                                                       action.host_loss, true);
                 if (host == ReclaimProgress::Spilling) { return host; }
@@ -821,11 +850,22 @@ public:
                                                              : ReclaimProgress::Changed;
                 }
                 if (!action.host_victims.empty()) { return ReclaimProgress::Changed; }
+                demotion_failed = true;
                 continue;
             }
             // Native quoted every holder required for this actual physical release.
             commit_release(program, action.release->sources, cursor, action.rank.loss);
-            device_release_erasures_ += action.release->sources.size();
+            const auto erased = action.release->sources.size();
+            device_release_erasures_ += erased;
+            const bool demotion_behind =
+                std::any_of(actions.begin() + static_cast<std::ptrdiff_t>(index) + 1, actions.end(),
+                            [](const auto& later) { return later.demotion.has_value(); });
+            const auto cause = demotion_failed     ? DeviceErasureCause::DemotionFailed
+                               : demotion_behind   ? DeviceErasureCause::RankedFirst
+                               : no_host_destination ? DeviceErasureCause::NoHostDestination
+                               : unadmitted          ? DeviceErasureCause::Unadmitted
+                                                     : DeviceErasureCause::NoDemotion;
+            device_erasure_causes_[static_cast<std::size_t>(cause)] += erased;
             return ReclaimProgress::Changed;
         }
         return waits_for_host ? ReclaimProgress::Spilling : ReclaimProgress::Blocked;
@@ -1469,7 +1509,8 @@ private:
     host_victims_in_order(Program& program, std::size_t bytes, std::optional<Handle> incoming,
                           std::span<const Handle> later_snapshots, std::span<const Handle> excluded,
                           std::optional<Admission> admission, const ReclaimCursor& cursor,
-                          Evaluation& evaluation, bool bytes_are_shortage = false) const {
+                          Evaluation& evaluation, bool bytes_are_shortage = false,
+                          bool demotion = false) const {
         const auto usage    = program.physical_usage();
         const auto free     = usage.capacity.host_bytes - usage.occupied.host_bytes;
         const auto required = bytes_are_shortage ? bytes : (bytes > free ? bytes - free : 0);
@@ -1529,7 +1570,14 @@ private:
                 // A migration must satisfy both its own preservation rights and the
                 // optional capture that requested space. Source heat cannot grant the
                 // outer capture permission to erase unrelated hot Host history.
-                if (!admits(program, combined, facts, admission, cursor, evaluation) ||
+                // A demotion's own preservation rights compare recovery loss and demand. Victims
+                // the lower tier takes whole lose neither, so they need only revocation rights.
+                const bool own =
+                    admits(program, combined, facts, admission, cursor, evaluation) ||
+                    (demotion && host_victim_policy_.erased &&
+                     may_revoke(combined, cursor.rights) &&
+                     host_victim_policy_.erased(program, combined).empty());
+                if (!own ||
                     !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
                     continue;
                 }
@@ -1647,6 +1695,7 @@ private:
     std::function<WallClock::time_point()> wall_clock_;
     std::uint64_t reclaim_erasures_        = 0;
     std::uint64_t device_release_erasures_ = 0;
+    std::array<std::uint64_t, kDeviceErasureCauses> device_erasure_causes_{};
     std::uint64_t spilled_demotions_       = 0;
     PrefixIndex<Model> index_;
     std::vector<Owner> owners_;
