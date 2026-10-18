@@ -662,10 +662,15 @@ public:
         expect_empty("cancelled restore leaked resources");
     }
 
-    // Greedy tokens after a cold restore equal Host restore and full prefill.
+    // A cold restore reproduces the Host bytes exactly, and greedy tokens after it equal Host
+    // restore and full prefill. The exact oracle is the byte comparison; the token comparison
+    // against full prefill needs a reference that is numerically stable: a prefill block of 128
+    // tokens or more is not bit-reproducible across runs (independent of this tier), so the
+    // reuse point is chunk aligned (the same blocks as full prefill) and the prompt is chosen
+    // with a wide top-1/top-2 margin on every step.
     void generation_equality() {
-        const auto prompt = tokens(300, 11);
-        const auto prefix = std::vector<TokenId>(prompt.begin(), prompt.begin() + 200);
+        const auto prompt = tokens(300, 12);
+        const auto prefix = std::vector<TokenId>(prompt.begin(), prompt.begin() + 256);
         constexpr std::uint32_t kDecode = 16;
 
         auto fresh_base   = request(prompt, false, kDecode + 1);
@@ -678,6 +683,7 @@ public:
         const auto host  = generate(bind(host_base, source), kDecode, false, nullptr);
 
         demote_all(set);
+        const auto host_bytes = host_objects(source);
         require(program_.start_spill(set).status == qwen::ColdStartStatus::Started,
                 "spill did not start");
         (void)wait_one();
@@ -687,6 +693,13 @@ public:
         require(program_.start_restore(source).status == qwen::ColdStartStatus::Started,
                 "restore did not start");
         require(wait_one().status == qwen::ColdJobStatus::Completed, "restore failed");
+        const auto restored_bytes = host_objects(source);
+        require(restored_bytes.size() == host_bytes.size(),
+                "restore changed the covered object set");
+        for (std::size_t index = 0; index < host_bytes.size(); ++index) {
+            require(restored_bytes[index].bytes == host_bytes[index].bytes,
+                    "restored Host bytes differ from the original Host replica");
+        }
         auto cold_base  = request(prompt, true, kDecode + 1);
         const auto cold = generate(bind(cold_base, source), kDecode, false, nullptr);
 
